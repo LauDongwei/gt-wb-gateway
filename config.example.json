@@ -1,0 +1,30 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "api_key": "",
+  "log_path": "gtwb.log",
+
+  "desensitize": true,
+  "compact_harness": true,
+  "strip_tool_metadata": true,
+  "retry_on_filter": true,
+
+  "timeout_s": 300,
+  "connect_timeout_s": 30,
+
+  "soft_cooldown_s": 60,
+  "soft_cooldown_max_s": 7200,
+  "notfound_cooldown_s": 60,
+  "breaker_threshold": 3,
+  "breaker_cooldown_s": 1800,
+  "breaker_cooldown_max_s": 21600,
+  "hard_cooldown_hour": 4,
+  "max_in_flight": 3,
+
+  "state_file": "state.json",
+
+  "auth_file": null,
+  "auth_dir": null,
+  "allow_account_rotation": false,
+  "refresh_skew_s": 300
+}

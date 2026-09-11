@@ -1,0 +1,19 @@
+# 运行时产物
+.venv/
+__pycache__/
+*.pyc
+_t/
+*.out
+
+# 含账号信息 / 明文令牌，绝不提交
+state.json
+gtwb.log
+config.json
+*.info
+auths/
+
+# 接入包里的 deeplink.txt / key.txt 是明文密钥
+deploy/home-client-kit/
+
+# setup.ps1 每次改写 config.json 前留的备份（含明文密钥）
+config.json.bak.*
