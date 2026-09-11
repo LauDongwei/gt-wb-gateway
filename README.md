@@ -16,6 +16,8 @@
 
 `python -m gtwb` 一行启动
 
+**简体中文** | [English](README_EN.md)
+
 </div>
 
 ---
@@ -326,5 +328,7 @@ gt-wb-gateway/
 <div align="center">
 
 如果这个项目对你有用，欢迎点个 ⭐
+
+**简体中文** | [English](README_EN.md)
 
 </div>
