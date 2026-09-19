@@ -111,6 +111,11 @@ class RequestStat:
         self.uid8 = ""
         self.usage: dict | None = None   # 后端完整 usage（供用量记账）
         self.elapsed: float | None = None
+        # 客户端来源。多机共享时这是排障的第一现场：没有它，日志里分不清
+        # 哪条请求来自家里 Mac、哪条来自本机，出问题只能靠时间戳猜。
+        self.client_ip = ""
+        self.client_ua = ""
+        self.client_kind = ""
 
     def first_byte(self) -> None:
         if self.ttfb is None:
@@ -168,6 +173,11 @@ class RequestStat:
             parts.append(f"uid={self.uid8}")
         if self.escalated:
             parts.append("escalated=1")
+        if self.client_ip or self.client_ua:
+            c = self.client_ip or "-"
+            if self.client_kind:
+                c += f" {self.client_kind}"
+            parts.append(f"client={c}")
         log(" | ".join(parts) + tag, self.rid)
 
     def _record(self) -> None:
@@ -177,6 +187,7 @@ class RequestStat:
         ct = u.get("completion_tokens_details") or {}
         rec = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "rid": self.rid,   # 与 gtwb.log 的行一一对应，便于交叉定位
             "mode": self.mode,
             "model": self.model,
             "status": self.status,
@@ -192,6 +203,10 @@ class RequestStat:
             "total_tokens": u.get("total_tokens"),
             "cached_tokens": pt.get("cached_tokens"),
             "reasoning_tokens": ct.get("reasoning_tokens"),
+            # 客户端来源：多机共享时用来区分是哪台机器/哪个客户端出的问题
+            "client_ip": self.client_ip,
+            "client_ua": self.client_ua,
+            "client_kind": self.client_kind,
         }
         _write_stat(rec)
 

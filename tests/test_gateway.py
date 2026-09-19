@@ -508,6 +508,96 @@ def test_client_identity() -> None:
     )
 
 
+def test_client_attribution() -> None:
+    """客户端来源识别与诊断快照。
+
+    多机共享时，"哪条请求来自家里 Mac、用的什么客户端" 是排障的第一现场。
+    没有它，日志里只能靠时间戳猜，出问题基本靠运气。
+    """
+    import contextlib
+    import io
+    import json
+    import tempfile
+
+    from gtwb import obs
+    from gtwb.diag import _aggregate, _is_bad
+    from gtwb.server import _client_kind, _client_zone, _tag_client
+
+    class _Req:
+        """最小 Request 替身：_tag_client 只用 client.host 与 headers.get。"""
+
+        def __init__(self, host: str, ua: str) -> None:
+            self.client = type("C", (), {"host": host})()
+            self.headers = {"user-agent": ua}
+
+    # ── UA → 客户端名 ──
+    check("识别 Codex CLI", _client_kind("codex_cli_rs/0.44.0 (Mac OS 15; arm64)") == "Codex CLI")
+    check("识别 Claude Code", _client_kind("claude-cli/2.0.1 (external, cli)") == "Claude Code")
+    check("识别 WorkBuddy", _client_kind("WorkBuddy/5.5.6") == "WorkBuddy")
+    check("识别 httpx", _client_kind("python-httpx/0.27") == "python-httpx")
+    check("空 UA 不崩且有标记", _client_kind("") == "未知UA")
+    check("陌名 UA 截断保留", len(_client_kind("x" * 200)) <= 25)
+
+    # ── IP → 区域 ──
+    check("本机区域", _client_zone("127.0.0.1") == "本机")
+    check("ZeroTier 区域", _client_zone("192.168.191.10") == "ZeroTier")
+    check("局域网区域", _client_zone("192.168.1.5") == "局域网")
+    check("10 段算局域网", _client_zone("10.0.0.7") == "局域网")
+    check("外部区域", _client_zone("8.8.8.8") == "外部")
+    check("空 IP 不崩", _client_zone("") == "未知")
+
+    # ── 打标会填进 stat，并给出可打印摘要 ──
+    st = obs.RequestStat("m", "CHAT", "r1")
+    desc = _tag_client(st, _Req("192.168.191.10", "codex_cli_rs/0.44.0"))
+    check("填充 client_ip", st.client_ip == "192.168.191.10")
+    check("填充 client_ua", "codex_cli_rs" in st.client_ua)
+    check("填充 client_kind", st.client_kind == "Codex CLI")
+    check("摘要含区域与客户端", "ZeroTier" in desc and "Codex CLI" in desc)
+
+    # ── 记账与日志都要带上来源（否则事后无法归因）──
+    tmpd = tempfile.mkdtemp()
+    obs.setup(os.path.join(tmpd, "t.log"), verbose=False)
+    try:
+        st2 = obs.RequestStat("m", "RESPONSES", "r9")
+        st2.client_ip, st2.client_ua, st2.client_kind = "192.168.191.10", "codex_cli_rs/0.44.0", "Codex CLI"
+        st2.status = 200
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            st2.done()
+        check("日志行含 client=", "client=192.168.191.10 Codex CLI" in buf.getvalue())
+        check("日志行含 rid", "[r9]" in buf.getvalue())
+
+        stat_path = os.path.join(tmpd, "usage-stats.jsonl")
+        recs = [json.loads(x) for x in open(stat_path, encoding="utf-8")]
+        check("记账含 client_ip", recs[0]["client_ip"] == "192.168.191.10")
+        check("记账含 client_kind", recs[0]["client_kind"] == "Codex CLI")
+        check("记账含 rid（可与日志对上）", recs[0]["rid"] == "r9")
+    finally:
+        obs.setup(None)
+
+    # ── 诊断聚合 ──
+    sample = [
+        {"client_ip": "192.168.191.10", "client_kind": "Codex CLI", "status": 200, "ts": "2026-09-19 20:00:00"},
+        {"client_ip": "192.168.191.10", "client_kind": "Codex CLI", "status": 400, "ts": "2026-09-19 20:01:00"},
+        {"client_ip": "192.168.191.10", "client_kind": "Codex CLI", "status": 200, "ts": "2026-09-19 20:02:00",
+         "escalated": True},
+        {"client_ip": "127.0.0.1", "client_kind": "curl", "status": 200, "ts": "2026-09-19 20:03:00"},
+    ]
+    g = _aggregate(sample)
+    check("聚合按来源+客户端分组", len(g) == 2)
+    check("请求量多的排前面", g[0]["ip"] == "192.168.191.10")
+    check("统计请求数", g[0]["n"] == 3)
+    check("统计成功数", g[0]["ok"] == 2)
+    check("统计失败数", g[0]["bad"] == 1)
+    check("统计降级数", g[0]["esc"] == 1)
+    check("最近时间取最后一条", g[0]["last"] == "2026-09-19 20:02:00")
+
+    check("异常判定：status>=400", _is_bad({"status": 400}) is True)
+    check("异常判定：200 不算异常", _is_bad({"status": 200}) is False)
+    check("异常判定：降级算异常", _is_bad({"status": 200, "escalated": True}) is True)
+    check("异常判定：审核命中算异常", _is_bad({"status": 200, "filtered": True}) is True)
+
+
 def main() -> int:
     test_classify()
     test_next_hour()
@@ -517,6 +607,7 @@ def main() -> int:
     test_protocol_adapters()
     test_hardening()
     test_client_identity()
+    test_client_attribution()
 
     print("\n" + "═" * 56)
     print(f"通过 {PASS} 项，失败 {len(FAIL)} 项")

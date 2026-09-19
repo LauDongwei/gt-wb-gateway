@@ -69,7 +69,7 @@ curl http://127.0.0.1:8787/v1/models   # 模型清单
 curl http://127.0.0.1:8787/status      # 冷却/熔断状态
 ```
 
-跑自测套件（99 项离线断言，覆盖状态机、登录态解析与协议硬化）：
+跑自测套件（131 项离线断言，覆盖状态机、登录态解析与协议硬化）：
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -235,6 +235,7 @@ Codex / Claude Code 的 system prompt 天然带 `sandbox`、`credential`、`esca
 | `--verbose` | 关 | 记录完整请求/响应体（排查审核用） |
 | `--allow-rotation` | 关 | 开启多账号轮转（**不建议**） |
 | `--show-config` | — | 打印最终生效配置后退出 |
+| `--diag` | — | 打印诊断快照后退出：谁在连、各客户端成功率、最近异常（见下方「诊断」） |
 
 config.json / 环境变量里的几个实用开关：
 
@@ -273,6 +274,53 @@ config.json / 环境变量里的几个实用开关：
 
 ---
 
+## 🔍 诊断
+
+多台机器共用一个网关时，"哪条请求来自哪台机器、用的什么客户端"是排障的第一现场。
+每条日志行都带 `client=`，一眼能看出：
+
+```
+[664dea9a] ▶ CHAT  | client=127.0.0.1 本机 curl | stream=False | msgs=1
+[b6e39511] ▶ CHAT  | client=192.168.191.10 ZeroTier Codex CLI | stream=False | msgs=1
+```
+
+来源分四类：`本机`（回环）、`ZeroTier`（`192.168.191.x`）、`局域网`、
+`外部`；客户端按 UA 识别为 `Codex CLI` / `Claude Code` / `WorkBuddy` / `curl` 等。
+
+一条命令看全貌：
+
+```bash
+python -m gtwb --diag                 # 谁在连 / 各客户端成功率 / 最近异常
+python -m gtwb --diag --lines 40      # 多看几条异常
+```
+
+输出示例：
+
+```
+── 客户端分布（记账文件末尾 1478 条；其中带来源字段 3 条）──
+  来源 IP            区域        客户端          请求    成功    失败    降级    审核  最近
+  192.168.191.10    ZeroTier  Codex CLI        312    310      2      0      0  2026-09-19 21:03:11
+  127.0.0.1         本机      curl                1      1      0      0      0  2026-09-19 20:56:39
+
+── 最近异常（共 15 条，显示最后 6 条）──
+  2026-09-19 17:47:52  rid=a1b2 192.168.191.10 Codex CLI  RESPONSES status=200 finish=tool_calls  降级重试
+```
+
+排查路径：
+
+1. **拿 `rid` 去日志里 grep** —— 能看到该请求的投影档位、上游往返、错误原文：
+   `grep a1b2 gtwb.log`
+2. **「降级重试」** = 首轮被上游拒绝后改用紧凑模式重发。偶发正常；
+   某客户端持续出现，说明它的 system prompt 触发了上游策略。
+3. **某客户端一条记录都没有** = 它根本没连上（网络 / 鉴权 / 地址问题），
+   先去那台机器 `curl` 一下 `/health`。
+4. **想看客户端到底发了什么**：设 `GTWB_CAPTURE_DIR` 后让它重放一次。
+
+记账文件 `usage-stats.jsonl` 是每请求一行的 JSONL，含 `rid` / `client_ip` /
+`client_kind` / `status` / `escalated` / `filtered` / token 明细，可直接喂给看板。
+
+---
+
 ## ✅ 实测验证记录
 
 以下为对**真实后端**的实测结果，非纸面推演：
@@ -284,12 +332,13 @@ config.json / 环境变量里的几个实用开关：
 | `/v1/chat/completions` 非流式 + 工具调用 | ✅ 200，`finish=tool_calls`，参数正确回传 |
 | `/v1/responses` 非流式 + 流式 | ✅ Codex 事件序列完整（created → in_progress → delta → done） |
 | `/v1/messages` 非流式 + 流式 | ✅ `content_block_start` / `text_delta` / `stop` 事件齐全 |
-| 自测套件 | ✅ 99 项离线断言全绿 |
+| 自测套件 | ✅ 131 项离线断言全绿 |
 | 局域网 / ZeroTier 真实调用 | ✅ 远程打真实模型返回正常，对外 `/health` 自动脱敏 |
 | 计划任务自启 + 双层自愈 | ✅ 进程级自愈 **14.8s**；整树崩溃后看门狗恢复 **5.3s** |
 | 启动器幂等守卫 | ✅ 服务健康时重复启动 **0.2s** 退出，不抢端口不热循环 |
 | CC Switch 深链导入 + 端到端 | ✅ 落库成功，`codex exec` 用导入配置返回 `GTWB-CCSW-OK` |
 | Codex CLI 真实跑通 | ✅ 多步 agent 端到端（读文件 → 分析 → 写产物），工具调用闭环、并行工具调用、**0 次降级重试** |
+| 客户端来源识别 | ✅ 日志与记账均带 `client=`，本机 / ZeroTier / 外部来源可区分，UA 识别到具体客户端 |
 | 长上下文保真 | ✅ 693,834 字符会话保留 **53.3%**，模型仍答对首轮任务与近期配置（旧实现仅 2.2%） |
 
 ---
@@ -347,6 +396,7 @@ gt-wb-gateway/
 │   ├── upstream.py       后端调用 + 错误分类 + 模型清单
 │   ├── resilience.py     冷却/熔断状态机 + 状态落盘
 │   ├── obs.py            结构化请求日志 + 单请求统计
+│   ├── diag.py           诊断快照（--diag：谁在连 / 成功率 / 最近异常）
 │   ├── server.py         HTTP 路由 + 统一执行链
 │   ├── desensitize.py            ┐
 │   ├── responses_adapter.py      │ 协议适配层
@@ -357,11 +407,13 @@ gt-wb-gateway/
 │   ├── uninstall.ps1       撤销部署（保留 config.json）
 │   ├── serve-loop.bat      常驻守护（幂等守卫 + 进程退出自动重启）
 │   ├── make-deeplink.py    生成 CC Switch 一键导入深链
-│   └── make-client-kit.py  生成「另一台电脑接入包」（含自检脚本）
+│   ├── make-client-kit.py  生成「另一台电脑接入包」（含自检脚本）
+│   ├── pack-mac-kit.py     把 Mac 接入包打成 zip（归一 LF + 可执行位）
+│   └── refresh-deeplinks.py 刷新各接入包深链（含 bearer token）
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch 三种接入方式 + 协议判定说明
 │   └── 双机共享-家里电脑.md    ZeroTier 双机方案 / 防火墙 / 稳定性清单 / 风控红线
-├── tests/                自测套件（99 项离线断言）
+├── tests/                自测套件（131 项离线断言）
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

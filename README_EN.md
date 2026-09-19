@@ -74,7 +74,7 @@ curl http://127.0.0.1:8787/v1/models   # model list
 curl http://127.0.0.1:8787/status      # cooldown / circuit-breaker state
 ```
 
-Run the test suite (99 offline assertions covering the state machine, session parsing and protocol hardening):
+Run the test suite (131 offline assertions covering the state machine, session parsing and protocol hardening):
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -251,6 +251,7 @@ environment variables. Priority: **defaults → config.json → env vars (`GTWB_
 | `--verbose` | off | Log full request/response bodies (for debugging content filters) |
 | `--allow-rotation` | off | Enable multi-account rotation (**not recommended**) |
 | `--show-config` | — | Print the effective config and exit |
+| `--diag` | — | Print a diagnostic snapshot and exit: who is connecting, per-client success rate, recent errors (see "Diagnostics") |
 
 ### Client identity reporting
 
@@ -280,6 +281,51 @@ To disable it (e.g. for A/B debugging): `--no-client-identity`,
 
 ---
 
+## 🔍 Diagnostics
+
+When several machines share one gateway, "which request came from which machine, via
+which client" is the first thing you need. Every log line carries `client=`:
+
+```
+[664dea9a] ▶ CHAT  | client=127.0.0.1 本机 curl | stream=False | msgs=1
+[b6e39511] ▶ CHAT  | client=192.168.191.10 ZeroTier Codex CLI | stream=False | msgs=1
+```
+
+Origins are classified as `本机` (loopback), `ZeroTier` (`192.168.191.x`), `局域网`
+(LAN) or `外部` (external); the client is recognised from its UA as
+`Codex CLI` / `Claude Code` / `WorkBuddy` / `curl` and so on.
+
+One command gives the whole picture:
+
+```bash
+python -m gtwb --diag                 # who is connecting / per-client success / recent errors
+python -m gtwb --diag --lines 40      # show more errors
+```
+
+```
+── 客户端分布（记账文件末尾 1478 条；其中带来源字段 3 条）──
+  来源 IP            区域        客户端          请求    成功    失败    降级    审核  最近
+  192.168.191.10    ZeroTier  Codex CLI        312    310      2      0      0  2026-09-19 21:03:11
+  127.0.0.1         本机      curl                1      1      0      0      0  2026-09-19 20:56:39
+```
+
+How to follow up:
+
+1. **Take the `rid` and grep the log** — projection mode, upstream round-trips and
+   the raw error are all there: `grep a1b2 gtwb.log`
+2. **"降级重试" (escalated)** = the first attempt was rejected upstream and retried in
+   compact mode. Occasional hits are normal; a client hitting it every time means its
+   system prompt trips the upstream policy.
+3. **A client with zero records** never connected at all (network / auth / address) —
+   `curl` its `/health` from that machine first.
+4. **To see exactly what a client sent**, set `GTWB_CAPTURE_DIR` and have it replay.
+
+The accounting file `usage-stats.jsonl` is one JSON object per request — `rid`,
+`client_ip`, `client_kind`, `status`, `escalated`, `filtered`, token breakdown — ready
+to feed into a dashboard.
+
+---
+
 ## ✅ Verified against the real backend
 
 These are measured results against the **real backend**, not paper claims:
@@ -291,12 +337,13 @@ These are measured results against the **real backend**, not paper claims:
 | `/v1/chat/completions` non-streaming + tool calls | ✅ 200, `finish=tool_calls`, args round-trip correctly |
 | `/v1/responses` non-streaming + streaming | ✅ complete Codex event sequence (created → in_progress → delta → done) |
 | `/v1/messages` non-streaming + streaming | ✅ `content_block_start` / `text_delta` / `stop` events all present |
-| Test suites | ✅ 99 offline assertions, all green |
+| Test suites | ✅ 131 offline assertions, all green |
 | LAN / ZeroTier real calls | ✅ real model calls succeed remotely; external `/health` auto-desensitized |
 | Scheduled task + two-layer self-healing | ✅ process-level recovery in **14.8s**; full-tree crash recovered by watchdog in **5.3s** |
 | Idempotent launcher guard | ✅ duplicate start exits in **0.2s** when healthy — no port grabbing, no hot loop |
 | CC Switch deep-link import + end-to-end | ✅ import landed; `codex exec` with the imported config returned `GTWB-CCSW-OK` |
 | Codex CLI real run | ✅ multi-step agent end-to-end (read file → analyse → write artifact); tool-call loop closed, parallel tool calls working, **zero escalation retries** |
+| Client origin attribution | ✅ logs and accounting both carry `client=`; loopback / ZeroTier / external origins distinguishable, UA resolved to a concrete client |
 | Long-context fidelity | ✅ a 693,834-char session retains **53.3%** and the model still answers both the opening task and recent config (old build: 2.2%) |
 
 ---
@@ -363,6 +410,7 @@ gt-wb-gateway/
 │   ├── upstream.py       backend calls + error classification + model list
 │   ├── resilience.py     cooldown/circuit-breaker state machine + state persistence
 │   ├── obs.py            structured request logs + per-request stats
+│   ├── diag.py           diagnostic snapshot (--diag: who connects / success / errors)
 │   ├── server.py         HTTP routing + unified execution chain
 │   ├── desensitize.py            ┐
 │   ├── responses_adapter.py      │ protocol adaptation layer
@@ -373,11 +421,13 @@ gt-wb-gateway/
 │   ├── uninstall.ps1       undo the deploy (keeps config.json)
 │   ├── serve-loop.bat      resident daemon (idempotent guard + auto-restart)
 │   ├── make-deeplink.py    generate CC Switch one-click import deep link
-│   └── make-client-kit.py  generate a "second computer" kit (with self-check script)
+│   ├── make-client-kit.py  generate a "second computer" kit (with self-check script)
+│   ├── pack-mac-kit.py     package the Mac kit as a zip (LF + exec bits)
+│   └── refresh-deeplinks.py  refresh deep links for all kits (incl. bearer token)
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch integration methods + protocol notes (Chinese)
 │   └── 双机共享-家里电脑.md    ZeroTier two-machine setup / firewall / stability / risk lines (Chinese)
-├── tests/                test suite (99 offline assertions)
+├── tests/                test suite (131 offline assertions)
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

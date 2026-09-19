@@ -35,6 +35,12 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--verbose", action="store_true", help="记录完整请求/响应体（排查审核拦截用）")
     ap.add_argument("--timeout", type=float, help="上游单请求超时秒数")
     ap.add_argument("--show-config", action="store_true", help="打印最终生效配置后退出")
+    ap.add_argument(
+        "--diag",
+        action="store_true",
+        help="打印诊断快照（谁在连/各客户端成功率/最近异常）后退出；不启动服务",
+    )
+    ap.add_argument("--lines", type=int, default=20, help="--diag 显示的异常条数（默认 20）")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     ap.add_argument("--version", action="version", version=f"gt-wb-gateway {__version__}")
     return ap
@@ -130,6 +136,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(d, ensure_ascii=False, indent=2))
         return 0
 
+    if args.diag:
+        from .diag import snapshot
+
+        print(snapshot(cfg, lines=max(1, args.lines)))
+        return 0
+
     gw = Gateway(cfg)
 
     if not args.skip_check:
@@ -150,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         w("   鉴权已启用（客户端需带 Bearer key）\n")
     if cfg.log_path:
         w(f"   日志    : {cfg.log_path}\n")
+    w("   诊断    : python -m gtwb --diag   （谁在连 / 成功率 / 最近异常）\n")
     w("   按 Ctrl+C 退出\n\n")
 
     import uvicorn

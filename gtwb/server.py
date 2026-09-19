@@ -142,6 +142,56 @@ def _is_loopback(request: Request) -> bool:
     return host in ("127.0.0.1", "::1", "localhost")
 
 
+# 客户端 UA → 人看得懂的名字。多机共享时，日志里能直接看出
+# "这条是家里 Mac 的 Codex"，而不是只看到一个版本号字符串。
+_CLIENT_SIGNATURES: tuple[tuple[str, str], ...] = (
+    ("codex", "Codex CLI"),
+    ("claude", "Claude Code"),
+    ("claude-code", "Claude Code"),
+    ("workbuddy", "WorkBuddy"),
+    ("codebuddy", "CodeBuddy CLI"),
+    ("anthropic", "Anthropic SDK"),
+    ("openai", "OpenAI SDK"),
+    ("httpx", "python-httpx"),
+    ("requests", "python-requests"),
+    ("axios", "axios"),
+    ("node", "node"),
+    ("curl", "curl"),
+)
+
+
+def _client_kind(ua: str) -> str:
+    u = (ua or "").lower()
+    if not u:
+        return "未知UA"
+    for key, name in _CLIENT_SIGNATURES:
+        if key in u:
+            return name
+    return obs.truncate(ua, 24)
+
+
+def _client_zone(ip: str) -> str:
+    """把来源 IP 归类，便于一眼看出是哪台机器。"""
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        return "本机"
+    if ip.startswith("192.168.191."):
+        return "ZeroTier"
+    if ip.startswith(("192.168.", "10.", "172.")):
+        return "局域网"
+    if not ip:
+        return "未知"
+    return "外部"
+
+
+def _tag_client(stat: obs.RequestStat, request: Request) -> str:
+    """给请求打上客户端来源，返回可打印摘要（供 ▶ 行）。"""
+    ip = (request.client.host if request.client else "") or ""
+    ua = request.headers.get("user-agent", "") or ""
+    stat.client_ip, stat.client_ua = ip, ua
+    stat.client_kind = _client_kind(ua)
+    return f"{ip or '-'} {_client_zone(ip)} {stat.client_kind}"
+
+
 def build_app(gw: Gateway) -> FastAPI:
     cfg = gw.cfg
     app = FastAPI(title="gt-wb-gateway", version="1.0")
@@ -369,7 +419,8 @@ def build_app(gw: Gateway) -> FastAPI:
         body = _desensitize(body)
         stat = obs.RequestStat(model, "CHAT", rid)
         obs.log(
-            f"▶ CHAT {model} | stream={wants_stream} | msgs={len(payload['messages'])}"
+            f"▶ CHAT {model} | client={_tag_client(stat, request)}"
+            f" | stream={wants_stream} | msgs={len(payload['messages'])}"
             f" | tools={[t.get('function', {}).get('name') for t in (payload.get('tools') or [])] or '-'}",
             rid,
         )
@@ -414,7 +465,8 @@ def build_app(gw: Gateway) -> FastAPI:
             body["model"] = model
         stat = obs.RequestStat(model, "RESPONSES", rid)
         obs.log(
-            f"▶ RESPONSES {model} | input_items={len(payload.get('input') or [])}"
+            f"▶ RESPONSES {model} | client={_tag_client(stat, request)}"
+            f" | input_items={len(payload.get('input') or [])}"
             f" | projection[{proj.get('mode')}] msgs {proj.get('original_messages')}→{proj.get('projected_messages')}"
             f" chars {proj.get('original_message_chars')}→{proj.get('projected_message_chars')}"
             f" tools {proj.get('original_tools')}→{proj.get('projected_tools')}",
@@ -473,7 +525,11 @@ def build_app(gw: Gateway) -> FastAPI:
         original_body = body
         body = _desensitize(body)
         stat = obs.RequestStat(model, "ANTHROPIC", rid)
-        obs.log(f"▶ ANTHROPIC {model} | msgs={len(body.get('messages') or [])}", rid)
+        obs.log(
+            f"▶ ANTHROPIC {model} | client={_tag_client(stat, request)}"
+            f" | msgs={len(body.get('messages') or [])}",
+            rid,
+        )
         obs.debug(rid, "ANTHROPIC → CHAT BODY", body)
 
         # Anthropic 协议默认非流式（与官方一致）；Claude Code 会显式带 stream=true
