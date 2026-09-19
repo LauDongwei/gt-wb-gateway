@@ -74,7 +74,7 @@ curl http://127.0.0.1:8787/v1/models   # model list
 curl http://127.0.0.1:8787/status      # cooldown / circuit-breaker state
 ```
 
-Run the test suite (89 offline assertions covering the state machine, session parsing and protocol hardening):
+Run the test suite (99 offline assertions covering the state machine, session parsing and protocol hardening):
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -247,9 +247,36 @@ environment variables. Priority: **defaults → config.json → env vars (`GTWB_
 | `--auth-file` / `--auth-dir` | auto-detect | Manual session location |
 | `--no-desensitize` | off | Disable desensitization (significantly higher false-block rate) |
 | `--no-compact` | off | Keep the full system prompt |
+| `--no-client-identity` | off | Do not report as the official client (see "Client identity" below) |
 | `--verbose` | off | Log full request/response bodies (for debugging content filters) |
 | `--allow-rotation` | off | Enable multi-account rotation (**not recommended**) |
 | `--show-config` | — | Print the effective config and exit |
+
+### Client identity reporting
+
+The backend identifies *which client* a call came from by **request headers**, and
+shows it in the "client" column of the usage breakdown on `workbuddy.cn`
+(Profile → Plan & usage → Usage details). Sending only `Authorization` without the
+identity headers leaves that column empty — awkward for auditing your own spend,
+and it makes the traffic look unattributed.
+
+By default the gateway reports the official client shape:
+
+| Header | Value |
+|---|---|
+| `X-IDE-Type` / `X-IDE-Name` | `WorkBuddy` |
+| `X-IDE-Version` | locally installed version (auto-detected from `install-manifest.json`) |
+| `X-Product` | `SaaS` |
+| `User-Agent` | `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>` |
+
+The version follows client upgrades automatically — no config change needed.
+To disable it (e.g. for A/B debugging): `--no-client-identity`,
+`client_identity: false`, or `GTWB_CLIENT_IDENTITY=0`.
+
+> Note: these headers only affect **attribution**. They do not change the nature of
+> using a subscription quota through a third-party client — that depends on the
+> subscription terms. Reporting them keeps the usage breakdown auditable and avoids
+> unattributed records.
 
 ---
 
@@ -264,7 +291,7 @@ These are measured results against the **real backend**, not paper claims:
 | `/v1/chat/completions` non-streaming + tool calls | ✅ 200, `finish=tool_calls`, args round-trip correctly |
 | `/v1/responses` non-streaming + streaming | ✅ complete Codex event sequence (created → in_progress → delta → done) |
 | `/v1/messages` non-streaming + streaming | ✅ `content_block_start` / `text_delta` / `stop` events all present |
-| Test suites | ✅ 89 offline assertions, all green |
+| Test suites | ✅ 99 offline assertions, all green |
 | LAN / ZeroTier real calls | ✅ real model calls succeed remotely; external `/health` auto-desensitized |
 | Scheduled task + two-layer self-healing | ✅ process-level recovery in **14.8s**; full-tree crash recovered by watchdog in **5.3s** |
 | Idempotent launcher guard | ✅ duplicate start exits in **0.2s** when healthy — no port grabbing, no hot loop |
@@ -350,7 +377,7 @@ gt-wb-gateway/
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch integration methods + protocol notes (Chinese)
 │   └── 双机共享-家里电脑.md    ZeroTier two-machine setup / firewall / stability / risk lines (Chinese)
-├── tests/                test suite (89 offline assertions)
+├── tests/                test suite (99 offline assertions)
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

@@ -69,7 +69,7 @@ curl http://127.0.0.1:8787/v1/models   # 模型清单
 curl http://127.0.0.1:8787/status      # 冷却/熔断状态
 ```
 
-跑自测套件（89 项离线断言，覆盖状态机、登录态解析与协议硬化）：
+跑自测套件（99 项离线断言，覆盖状态机、登录态解析与协议硬化）：
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -231,6 +231,7 @@ Codex / Claude Code 的 system prompt 天然带 `sandbox`、`credential`、`esca
 | `--auth-file` / `--auth-dir` | 自动探测 | 手动指定登录态 |
 | `--no-desensitize` | 关 | 关闭脱敏（误拦概率显著上升） |
 | `--no-compact` | 关 | 保留完整 system prompt |
+| `--no-client-identity` | 关 | 不按官方客户端身份上报（见下方「客户端身份」） |
 | `--verbose` | 关 | 记录完整请求/响应体（排查审核用） |
 | `--allow-rotation` | 关 | 开启多账号轮转（**不建议**） |
 | `--show-config` | — | 打印最终生效配置后退出 |
@@ -243,6 +244,32 @@ config.json / 环境变量里的几个实用开关：
 | `model_aliases` | `GTWB_MODEL_ALIASES` | 模型名映射，如 `{"gpt-5.6-luna": "glm-5.3"}` |
 | `capture_dir` | `GTWB_CAPTURE_DIR` | 诊断抓包目录：把客户端**原始请求体**落盘，排查"Codex 到底发了什么"最快 |
 | `preserve_harness` | `GTWB_PRESERVE_HARNESS` | 保留 harness 提示词（默认开，关掉会显著降低 agent 可用性） |
+| `client_identity` | `GTWB_CLIENT_IDENTITY` | 按官方客户端身份上报 UA 与 `X-IDE-*`（默认开，见下） |
+| `client_version` | `GTWB_CLIENT_VERSION` | 上报的客户端版本，留空则**自动探测**本机安装版本 |
+
+### 客户端身份上报
+
+后端靠**请求头**判断"这次调用来自哪个客户端"，并把结果显示在
+`workbuddy.cn` → 个人主页 → 套餐与用量 → 用量明细的「客户端」列。
+只发 `Authorization` 而漏掉身份头，该列会是空的——既不便核对消耗，
+也让流量看起来来源不明。
+
+网关默认按官方客户端的形状上报：
+
+| 头 | 取值 |
+|---|---|
+| `X-IDE-Type` / `X-IDE-Name` | `WorkBuddy` |
+| `X-IDE-Version` | 本机安装版本（自动探测 `install-manifest.json` 的 `appVersion`） |
+| `X-Product` | `SaaS` |
+| `User-Agent` | `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>` |
+
+客户端升级后版本号自动跟随，无需改配置。想关闭（例如排查用）：
+命令行 `--no-client-identity`，或配置 `client_identity: false`，
+或环境变量 `GTWB_CLIENT_IDENTITY=0`。
+
+> 说明：这组头只影响**归因显示**，不改变"用第三方客户端消耗订阅额度"这件事
+> 本身的性质——那取决于订阅条款。补上它，是为了让用量明细可对账、
+> 避免出现"来源不明"的记录。
 
 ---
 
@@ -257,7 +284,7 @@ config.json / 环境变量里的几个实用开关：
 | `/v1/chat/completions` 非流式 + 工具调用 | ✅ 200，`finish=tool_calls`，参数正确回传 |
 | `/v1/responses` 非流式 + 流式 | ✅ Codex 事件序列完整（created → in_progress → delta → done） |
 | `/v1/messages` 非流式 + 流式 | ✅ `content_block_start` / `text_delta` / `stop` 事件齐全 |
-| 自测套件 | ✅ 89 项离线断言全绿 |
+| 自测套件 | ✅ 99 项离线断言全绿 |
 | 局域网 / ZeroTier 真实调用 | ✅ 远程打真实模型返回正常，对外 `/health` 自动脱敏 |
 | 计划任务自启 + 双层自愈 | ✅ 进程级自愈 **14.8s**；整树崩溃后看门狗恢复 **5.3s** |
 | 启动器幂等守卫 | ✅ 服务健康时重复启动 **0.2s** 退出，不抢端口不热循环 |
@@ -334,7 +361,7 @@ gt-wb-gateway/
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch 三种接入方式 + 协议判定说明
 │   └── 双机共享-家里电脑.md    ZeroTier 双机方案 / 防火墙 / 稳定性清单 / 风控红线
-├── tests/                自测套件（89 项离线断言）
+├── tests/                自测套件（99 项离线断言）
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

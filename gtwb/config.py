@@ -19,8 +19,81 @@ from typing import Any
 BACKEND_CHAT = "https://copilot.tencent.com"
 # 网页/计费域，作为 domain 回退与 Origin/Referer 取值来源。
 WEB_ORIGIN = "https://www.codebuddy.cn"
-# 官方 CLI 的 UA；后端会按 UA 决定放行策略。
-USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
+
+# ---------------------------------------------------------------------------
+# 客户端身份（后端据此归因用量明细里的「客户端」列）
+# ---------------------------------------------------------------------------
+#
+# 实证来源（本机安装包，非猜测）：
+#   1. 桌面端 `resources/app.asar` 向被拉起的 agent-cli 注入
+#      CLIENT_INFO_PLATFORM / CLIENT_INFO_IDE_TYPE = "WorkBuddy"，
+#      CLIENT_INFO_USER_AGENT_EXTENSION = `CLI/<cliVersion>`。
+#   2. agent-cli 组装请求头时写：
+#        X-IDE-Type    = ideType   || PRODUCT_TYPE
+#        X-IDE-Name    = platform  || PRODUCT_TYPE
+#        X-IDE-Version = platformVersion
+#        X-Product     = deploymentType（SaaS）
+#        User-Agent    = "<product>/<ver> <platform>/<ver> CLI/<cliVer>"
+#   3. 桌面端注释自述该版本号"用于服务端白名单识别客户端身份"。
+#
+# 换句话说：后端靠这组头（而不是靠请求体）判断"这次调用来自哪个客户端"。
+# 只发 Authorization 而漏掉这组头 → 用量明细的「客户端」列归因为空。
+CLIENT_NAME = "WorkBuddy"
+# 桌面端版本探测失败时的兜底值（本机 2026-09-10 安装版实测）。
+DEFAULT_CLIENT_VERSION = "5.5.6"
+# 随包 CLI 版本兜底值（`node cli/dist/codebuddy.js --version` 实测）。
+DEFAULT_CLI_VERSION = "2.137.1"
+# 更早版本用的 UA：那是 CodeBuddy CLI 的身份，不是 WorkBuddy 桌面端，
+# 保留仅为兼容显式配置。
+LEGACY_USER_AGENT = "CLI/2.63.2 CodeBuddy/2.63.2"
+
+
+def _client_manifest_candidates() -> list[str]:
+    """各平台 WorkBuddy 桌面端安装清单路径（含 appVersion 字段）。"""
+    import sys
+
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "")
+        return [
+            os.path.join(local, "Programs/WorkBuddy/resources/install-manifest.json"),
+            r"C:\Program Files\WorkBuddy\resources\install-manifest.json",
+            r"D:\Program Files\WorkBuddy\resources\install-manifest.json",
+        ]
+    if sys.platform == "darwin":
+        return [
+            "/Applications/WorkBuddy.app/Contents/Resources/install-manifest.json",
+        ]
+    return [
+        "/opt/WorkBuddy/resources/install-manifest.json",
+        os.path.expanduser("~/.local/share/WorkBuddy/resources/install-manifest.json"),
+    ]
+
+
+_CLIENT_VERSION_CACHE: dict[str, str] = {}
+
+
+def detect_client_version() -> str:
+    """自动探测本机 WorkBuddy 桌面端版本；探测不到返回空串（由调用方兜底）。
+
+    自动探测而不是写死，是因为客户端升级后版本号会变，而版本号是上游
+    识别客户端身份的一部分。结果进程内缓存，不做重复磁盘 IO。
+    """
+    if "v" in _CLIENT_VERSION_CACHE:
+        return _CLIENT_VERSION_CACHE["v"]
+    found = ""
+    for p in _client_manifest_candidates():
+        try:
+            if not os.path.isfile(p):
+                continue
+            data = json.loads(open(p, encoding="utf-8-sig").read())
+            v = str(data.get("appVersion") or "").strip()
+            if v:
+                found = v
+                break
+        except Exception:
+            continue
+    _CLIENT_VERSION_CACHE["v"] = found
+    return found
 
 CHAT_PATH = "/v2/chat/completions"
 REFRESH_PATH = "/v2/plugin/auth/token/refresh"
@@ -75,10 +148,20 @@ class Config:
     # 诊断抓包目录（非空则把每个 /v1/responses 请求体落盘，用于排查协议问题）
     capture_dir: str | None = None
 
+    # ── 客户端身份上报 ────────────────────────────────────────────────────
+    # 后端按 X-IDE-* 与 UA 归因用量明细的「客户端」列。只发 Authorization
+    # 会让该列归因为空 —— 既不便自己核对消耗，也更容易被当成来源不明的流量。
+    # 默认按本机官方客户端身份上报，与官方记录保持一致。
+    client_identity: bool = True
+    client_name: str = CLIENT_NAME
+    client_version: str = ""  # 空 = 自动探测本机安装版本
+    cli_version: str = ""  # 空 = 内置兜底
+    # 显式指定则覆盖上面两项拼出的 UA（一般留空即可）。
+    user_agent: str = ""
+
     # ── 上游 ──────────────────────────────────────────────────────────────
     backend: str = BACKEND_CHAT
     web_origin: str = WEB_ORIGIN
-    user_agent: str = USER_AGENT
     timeout_s: float = 300.0  # 单次上游请求总超时
     connect_timeout_s: float = 30.0
 
@@ -102,6 +185,33 @@ class Config:
     auth_dir: str | None = None  # 指定目录 → 扫描其中全部 .info（多账号）
     allow_account_rotation: bool = False  # 是否允许多账号轮转（默认关闭，见 README 风险说明）
     refresh_skew_s: int = 300  # 距过期不足此时长就先刷新
+
+    # ── 客户端身份解析 ────────────────────────────────────────────────────
+
+    def resolved_client_version(self) -> str:
+        return self.client_version or detect_client_version() or DEFAULT_CLIENT_VERSION
+
+    def resolved_cli_version(self) -> str:
+        return self.cli_version or DEFAULT_CLI_VERSION
+
+    def official_user_agent(self) -> str:
+        """按官方客户端格式拼 UA。
+
+        官方格式：`<product>/<ver> <platform>/<ver> CLI/<cliVer>`。
+        WorkBuddy 桌面端下 product 与 platform 同为 "WorkBuddy"，
+        两处版本号同为桌面端版本，末段是随包 CLI 版本。
+        """
+        name = self.client_name or CLIENT_NAME
+        v = self.resolved_client_version()
+        return f"{name}/{v} {name}/{v} CLI/{self.resolved_cli_version()}"
+
+    def effective_user_agent(self) -> str:
+        """最终用于上游的 UA：显式配置优先，其次按身份开关决定。"""
+        if self.user_agent:
+            return self.user_agent
+        if self.client_identity:
+            return self.official_user_agent()
+        return LEGACY_USER_AGENT
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -134,6 +244,11 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "GTWB_CAPTURE_DIR": ("capture_dir", str),
     "GTWB_BACKEND": ("backend", str),
     "GTWB_TIMEOUT": ("timeout_s", float),
+    "GTWB_CLIENT_IDENTITY": ("client_identity", bool),
+    "GTWB_CLIENT_NAME": ("client_name", str),
+    "GTWB_CLIENT_VERSION": ("client_version", str),
+    "GTWB_CLI_VERSION": ("cli_version", str),
+    "GTWB_USER_AGENT": ("user_agent", str),
     "GTWB_STATE_FILE": ("state_file", str),
     "GTWB_AUTH_FILE": ("auth_file", str),
     "GTWB_AUTH_DIR": ("auth_dir", str),

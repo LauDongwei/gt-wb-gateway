@@ -27,6 +27,11 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--allow-rotation", action="store_true", help="开启多账号轮转（默认关闭，见 README 风险说明）")
     ap.add_argument("--no-desensitize", action="store_true", help="关闭脱敏（审核拦截概率显著上升）")
     ap.add_argument("--no-compact", action="store_true", help="保留完整 system prompt，仅做零宽脱敏")
+    ap.add_argument(
+        "--no-client-identity",
+        action="store_true",
+        help="不按官方客户端身份上报（UA 与 X-IDE-* 一并回退，用于 A/B 排查）",
+    )
     ap.add_argument("--verbose", action="store_true", help="记录完整请求/响应体（排查审核拦截用）")
     ap.add_argument("--timeout", type=float, help="上游单请求超时秒数")
     ap.add_argument("--show-config", action="store_true", help="打印最终生效配置后退出")
@@ -52,6 +57,8 @@ def _make_config(args: argparse.Namespace) -> Config:
         overrides["desensitize"] = False
     if args.no_compact:
         overrides["compact_harness"] = False
+    if args.no_client_identity:
+        overrides["client_identity"] = False
     return load_config(args.config, overrides=overrides)
 
 
@@ -61,8 +68,15 @@ async def _preflight(cfg: Config, gw: Gateway) -> bool:
     w(f"版本    : gt-wb-gateway {__version__}\n")
     w(f"Python  : {sys.version.split()[0]}  ({sys.platform})\n")
     w(f"后端    : {cfg.backend}\n")
-    w(f"脱敏    : {'开' if cfg.desensitize else '关'}｜"
-      f"harness {'压缩' if cfg.compact_harness else '保留全文'}\n")
+    w(
+        f"脱敏    : {'开' if cfg.desensitize else '关'}｜"
+        f"harness {'压缩' if cfg.compact_harness else '保留全文'}\n"
+    )
+    if cfg.client_identity:
+        w(f"客户端  : {cfg.client_name}/{cfg.resolved_client_version()}"
+          f"（用量明细「客户端」列归因用）\n")
+    else:
+        w("客户端  : 关闭身份上报（用量明细「客户端」列会为空）\n")
 
     cands = gw.accounts.discover_summary()
     if not cands:

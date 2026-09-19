@@ -102,10 +102,15 @@ def chat_headers(cfg: C.Config, acct: Account) -> dict[str, str]:
         "X-Requested-With": "XMLHttpRequest",
         "Origin": cfg.web_origin,
         "Referer": cfg.web_origin + "/",
-        "User-Agent": cfg.user_agent,
+        "User-Agent": cfg.effective_user_agent(),
         "X-Product": "SaaS",
         "Authorization": f"Bearer {acct.access_token}",
     }
+    if cfg.client_identity:
+        # 后端据此归因用量明细的「客户端」列。官方客户端三者同源（见 config 注释）。
+        h["X-IDE-Type"] = cfg.client_name
+        h["X-IDE-Name"] = cfg.client_name
+        h["X-IDE-Version"] = cfg.resolved_client_version()
     if acct.uid:
         h["X-User-Id"] = acct.uid
     else:
@@ -130,7 +135,7 @@ def refresh_headers(cfg: C.Config, acct: Account) -> dict[str, str]:
         "X-Requested-With": "XMLHttpRequest",
         "Origin": cfg.web_origin,
         "Referer": cfg.web_origin + "/",
-        "User-Agent": cfg.user_agent,
+        "User-Agent": cfg.effective_user_agent(),
         "Authorization": f"Bearer {acct.access_token}",
         "X-Refresh-Token": acct.refresh_token,
         "X-Auth-Refresh-Source": "workbuddy",

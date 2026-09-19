@@ -465,6 +465,49 @@ def test_hardening():
         check("未配置 capture_dir 时不写盘", SV._capture(Config(api_key=""), "responses", {}) is None)
 
 
+def test_client_identity() -> None:
+    """客户端身份头：后端据此归因用量明细的「客户端」列。
+
+    官方客户端（桌面端 + 随包 CLI）会发 X-IDE-Type / X-IDE-Name / X-IDE-Version，
+    UA 形如 "<product>/<ver> <platform>/<ver> CLI/<cliVer>"。漏发这组头会让
+    用量明细的「客户端」列空着 —— 既不便核对消耗，也更像来源不明的流量。
+    """
+    from gtwb import config as CF
+    from gtwb.auth import Account
+    from gtwb.upstream import chat_headers
+
+    acct = Account(access_token="t", refresh_token="r", uid="1", enterprise_id="", domain="")
+
+    cfg = Config(api_key="", client_version="9.9.9", cli_version="1.2.3")
+    h = chat_headers(cfg, acct)
+    check("上报 X-IDE-Type", h.get("X-IDE-Type") == "WorkBuddy")
+    check("上报 X-IDE-Name", h.get("X-IDE-Name") == "WorkBuddy")
+    check("上报 X-IDE-Version", h.get("X-IDE-Version") == "9.9.9")
+    check("X-Product 仍为 SaaS", h.get("X-Product") == "SaaS")
+    check(
+        "UA 为官方格式",
+        h.get("User-Agent") == "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/1.2.3",
+    )
+    check("UA 不再自称 CodeBuddy", "CodeBuddy" not in h.get("User-Agent", ""))
+
+    # 关掉开关则退回旧身份，且不再发明文身份头（便于 A/B 排查）。
+    cfg_off = Config(api_key="", client_identity=False)
+    h_off = chat_headers(cfg_off, acct)
+    check("关闭后不发 X-IDE-Name", "X-IDE-Name" not in h_off)
+    check("关闭后 UA 回退为旧值", h_off.get("User-Agent") == CF.LEGACY_USER_AGENT)
+
+    # 显式 UA 优先于一切。
+    cfg_ua = Config(api_key="", user_agent="MyUA/1")
+    check("显式 UA 优先", chat_headers(cfg_ua, acct).get("User-Agent") == "MyUA/1")
+
+    # 探测不到安装版本时必须兜底成非空，不能拼出 "WorkBuddy//"。
+    cfg_probe = Config(api_key="")
+    check(
+        "版本兜底非空",
+        bool(cfg_probe.resolved_client_version()) and "//" not in cfg_probe.official_user_agent(),
+    )
+
+
 def main() -> int:
     test_classify()
     test_next_hour()
@@ -473,6 +516,7 @@ def main() -> int:
     test_model_extraction()
     test_protocol_adapters()
     test_hardening()
+    test_client_identity()
 
     print("\n" + "═" * 56)
     print(f"通过 {PASS} 项，失败 {len(FAIL)} 项")

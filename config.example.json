@@ -14,6 +14,12 @@
   "model_aliases": {},
   "capture_dir": null,
 
+  "client_identity": true,
+  "client_name": "WorkBuddy",
+  "client_version": "",
+  "cli_version": "",
+  "user_agent": "",
+
   "timeout_s": 300,
   "connect_timeout_s": 30,
 
