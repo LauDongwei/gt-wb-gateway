@@ -27,7 +27,7 @@ def _rand_id(prefix: str = "resp_") -> str:
 # 请求转换：Responses → Chat
 # ---------------------------------------------------------------------------
 
-def responses_request_to_chat(body: dict) -> dict:
+def responses_request_to_chat(body: dict) -> tuple[dict, dict[str, str]]:
     """将 Responses API 请求体转换为 Chat Completions 请求体。
 
     关键映射：
@@ -35,7 +35,11 @@ def responses_request_to_chat(body: dict) -> dict:
       instructions → system message（置顶）
       max_output_tokens → max_tokens
       tools 格式微调（Responses 用 name，Chat 用 function.name）
+      namespace 工具容器 → 提升为顶层 function，返回 bare→namespace 映射
+
+    返回 (chat_body, bare_to_ns)。
     """
+    bare_to_ns: dict[str, str] = {}
     messages: list[dict] = []
 
     # instructions → system message
@@ -60,16 +64,30 @@ def responses_request_to_chat(body: dict) -> dict:
     # tools — Responses 和 Chat 的 function tool 格式略有不同
     tools = body.get("tools")
     if tools:
-        chat["tools"] = _convert_tools_for_chat(tools)
+        chat_tools, bare_to_ns = _convert_tools_for_chat(tools)
+        if chat_tools:
+            chat["tools"] = chat_tools
     if "tool_choice" in body:
-        chat["tool_choice"] = body["tool_choice"]
+        chat["tool_choice"] = _convert_tool_choice(body["tool_choice"])
 
     # 透传常见参数
     for key in ("temperature", "top_p", "stop", "seed",
                 "presence_penalty", "frequency_penalty",
-                "response_format", "reasoning_effort"):
+                "response_format", "parallel_tool_calls"):
         if key in body:
             chat[key] = body[key]
+
+    # 推理强度：Codex 发的是嵌套对象 {"effort": "high", "summary": "auto"}，
+    # 早期实现只找顶层 reasoning_effort，导致客户端的强度选择被静默忽略。
+    effort = body.get("reasoning_effort")
+    if not effort and isinstance(body.get("reasoning"), dict):
+        effort = body["reasoning"].get("effort")
+    if effort:
+        chat["reasoning_effort"] = effort
+
+    # 提示词缓存键：Codex 每轮都带，透传可显著提高上游 prefix cache 命中率。
+    if body.get("prompt_cache_key"):
+        chat["prompt_cache_key"] = body["prompt_cache_key"]
 
     # max_output_tokens → max_tokens
     if "max_output_tokens" in body:
@@ -77,7 +95,7 @@ def responses_request_to_chat(body: dict) -> dict:
     elif "max_tokens" in body:
         chat["max_tokens"] = body["max_tokens"]
 
-    return chat
+    return chat, bare_to_ns
 
 
 def _convert_input_items(items: list) -> list[dict]:
@@ -116,7 +134,7 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type is None and role in ("user", "system", "developer"):
             _flush_assistant()
             mapped_role = "system" if role == "developer" else role
-            content = _extract_content(item.get("content", ""))
+            content = _extract_content_parts(item.get("content", ""))
             messages.append({"role": mapped_role, "content": content})
             continue
 
@@ -124,7 +142,7 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type == "message" and role in ("user", "system", "developer"):
             _flush_assistant()
             mapped_role = "system" if role == "developer" else role
-            content = _extract_content(item.get("content", ""))
+            content = _extract_content_parts(item.get("content", ""))
             messages.append({"role": mapped_role, "content": content})
             continue
 
@@ -141,6 +159,14 @@ def _convert_input_items(items: list) -> list[dict]:
             _flush_assistant()
             content = _extract_content(item.get("content", ""))
             pending_assistant_content = content
+            # chat 风格的 tool_calls 直接随消息携带，必须承接（否则多轮工具历史断裂）
+            for tc in item.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("function"):
+                    pending_tool_calls.append({
+                        "id": tc.get("id", _rand_id("call_")),
+                        "type": "function",
+                        "function": tc["function"],
+                    })
             continue
 
         # function_call — 合并到前面的 assistant 消息
@@ -160,11 +186,70 @@ def _convert_input_items(items: list) -> list[dict]:
         # function_call_output → tool 消息
         if item_type == "function_call_output":
             _flush_assistant()
+            output = item.get("output", "")
+            text_out, images = _split_tool_output_images(output)
             messages.append({
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
-                "content": item.get("output", ""),
+                "content": text_out,
             })
+            # Chat 协议的 tool 消息只能放文本；工具输出里的图片改为紧随其后的
+            # 一条 user 消息承载（否则模型"看不见图"，且 base64 会被静默丢弃）。
+            if images:
+                messages.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": "[Image output from the previous tool call]"}]
+                    + [{"type": "image_url", "image_url": {"url": u}} for u in images],
+                })
+            continue
+
+        # reasoning 项（Codex 开启 reasoning summary 时带回）：
+        # Chat 后端没有对应容器，跳过但显式计数，避免"静默丢失"无从察觉。
+        if item_type == "reasoning":
+            continue
+
+        # 其它 *_call / *_call_output（local_shell_call 等未来类型）
+        if isinstance(item_type, str) and item_type.endswith("_call_output"):
+            _flush_assistant()
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id", ""),
+                "content": _normalize_tool_output(item.get("output", "")),
+            })
+            continue
+        if isinstance(item_type, str) and item_type.endswith("_call"):
+            if pending_assistant_content is None:
+                pending_assistant_content = ""
+            pending_tool_calls.append({
+                "id": item.get("call_id", item.get("id", _rand_id("call_"))),
+                "type": "function",
+                "function": {
+                    "name": item.get("name", item_type[:-5]),
+                    "arguments": _normalize_call_arguments(item),
+                },
+            })
+            continue
+
+        # Chat 风格 tool 结果消息（role=tool，无 type 标记）— 必须保留 tool_call_id
+        if item_type is None and role == "tool":
+            _flush_assistant()
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("tool_call_id", item.get("call_id", "")),
+                "content": _normalize_tool_output(item.get("output", item.get("content", ""))),
+            })
+            continue
+
+        # 顶层图片输入项（图片也可能直接放在 input 数组顶层）
+        if item_type == "input_image":
+            _flush_assistant()
+            url = item.get("image_url", item.get("url", ""))
+            if isinstance(url, dict):
+                url = url.get("url", "")
+            if url:
+                messages.append({"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": url}}
+                ]})
             continue
 
         # 其他未知类型 — 尝试当作普通消息
@@ -177,8 +262,98 @@ def _convert_input_items(items: list) -> list[dict]:
     return messages
 
 
+def _normalize_tool_output(output) -> str:
+    """Chat 协议的 tool 消息 content 必须是字符串。
+
+    Codex/MCP 工具的 output 可能是结构化对象（dict/list），统一序列化为 JSON 字符串。
+    """
+    if isinstance(output, str):
+        return output
+    if output is None:
+        return ""
+    try:
+        return json.dumps(output, ensure_ascii=False)
+    except Exception:
+        return str(output)
+
+
+def _split_tool_output_images(output) -> tuple[str, list[str]]:
+    """从工具输出里分离图片，返回 (文本, 图片 URL 列表)。
+
+    Codex / MCP 工具的 output 可能是 parts 数组，其中含 input_image。
+    Chat 协议的 tool 消息只接字符串，图片若直接 json.dumps 会让 base64 白占 token
+    且模型根本看不到；这里把图片摘出来单独承载。
+    """
+    urls: list[str] = []
+    rest: list = []
+
+    def _pull(node) -> None:
+        if isinstance(node, dict):
+            t = node.get("type")
+            if t in ("input_image", "image_url", "computer_screenshot"):
+                url = node.get("image_url") or node.get("url") or node.get("source")
+                if isinstance(url, dict):
+                    url = url.get("url") or url.get("data")
+                if isinstance(url, str) and url:
+                    urls.append(url)
+                    return
+            if node.get("image_url"):
+                url = node["image_url"]
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if isinstance(url, str) and url:
+                    urls.append(url)
+                    return
+            rest.append({k: v for k, v in node.items() if k != "image_url"})
+            return
+        rest.append(node)
+
+    if isinstance(output, list):
+        for item in output:
+            _pull(item)
+        text = _normalize_tool_output(rest) if rest else ""
+    else:
+        text = _normalize_tool_output(output)
+
+    return text, urls
+
+
+def _normalize_call_arguments(item: dict) -> str:
+    """把非 function_call 类工具的调用参数归一成 JSON 字符串。"""
+    for key in ("arguments", "action", "input"):
+        val = item.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            # 已经是 JSON 字符串就直接用，否则包一层
+            try:
+                json.loads(val)
+                return val
+            except Exception:
+                return json.dumps({"input": val}, ensure_ascii=False)
+        try:
+            return json.dumps(val, ensure_ascii=False)
+        except Exception:
+            return json.dumps({"input": str(val)}, ensure_ascii=False)
+    return "{}"
+
+
+def _convert_tool_choice(tool_choice) -> Any:
+    """Responses 的 tool_choice → Chat 格式。
+
+    字符串（auto/none/required/none）两边通用；
+    命名选择 Responses 是 {"type":"function","name":"shell"}，
+    Chat 是 {"type":"function","function":{"name":"shell"}}。
+    """
+    if isinstance(tool_choice, dict) and "function" not in tool_choice:
+        name = tool_choice.get("name", "")
+        if name:
+            return {"type": "function", "function": {"name": name}}
+    return tool_choice
+
+
 def _extract_content(content) -> str:
-    """提取 content（可能是 str / list[{type,text}]）。"""
+    """提取 content（可能是 str / list[{type,text}]）为纯文本（不含图片）。"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -195,6 +370,40 @@ def _extract_content(content) -> str:
     return str(content)
 
 
+def _extract_content_parts(content) -> str | list:
+    """提取 content；含图片（input_image）时返回 Chat 多模态 parts，否则返回纯文本。
+
+    Responses 的 input_image 形如 {"type":"input_image","image_url":"data:..."}，
+    image_url 可能是字符串，也可能是 {"url": ...}；统一转成 Chat 的 image_url part。
+    """
+    if not isinstance(content, list):
+        return _extract_content(content)
+    text_parts: list[str] = []
+    image_parts: list[dict] = []
+    for p in content:
+        if isinstance(p, dict):
+            t = p.get("type")
+            if t in ("input_text", "text", "output_text"):
+                text_parts.append(p.get("text", ""))
+            elif t == "input_image":
+                url = p.get("image_url", p.get("url", ""))
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if url:
+                    image_parts.append({"type": "image_url", "image_url": {"url": url}})
+        elif isinstance(p, str):
+            text_parts.append(p)
+    if not image_parts:
+        text = "".join(text_parts)
+        return text or _extract_content(content)
+    parts: list[dict] = []
+    text = "".join(text_parts).strip()
+    if text:
+        parts.append({"type": "text", "text": text})
+    parts.extend(image_parts)
+    return parts
+
+
 def _extract_output_text(content_parts: list) -> str:
     """从 Responses output content parts 提取纯文本。"""
     texts = []
@@ -204,24 +413,66 @@ def _extract_output_text(content_parts: list) -> str:
     return "".join(texts)
 
 
-def _convert_tools_for_chat(tools: list) -> list:
+def _convert_tools_for_chat(tools: list) -> tuple[list, dict[str, str]]:
     """将 Responses 格式的 tools 转为 Chat 格式。
 
     Responses:  {"type": "function", "name": "shell", "description": ..., "parameters": ...}
     Chat:       {"type": "function", "function": {"name": "shell", "description": ..., "parameters": ...}}
+
+    Codex 0.117+ 会把 MCP 工具打包成 namespace 容器：
+      {"type": "namespace", "name": "mcp__cua_repl", "description": ...,
+       "tools": [{"type": "function", "name": "js", ...}, ...]}
+    Chat 协议不认识 namespace，这里把子工具"提升"为顶层 function 工具（裸名），
+    并返回 bare→namespace 映射；模型回传调用时由转换器把 namespace 字段还原，
+    Codex 客户端据此路由到对应 MCP 服务器。
+    其他托管型工具（web_search 等）需在 OpenAI 服务端执行，Chat 后端无法承接，丢弃。
     """
-    result = []
+    from . import obs  # 延迟导入避免循环依赖
+
+    result: list[dict] = []
+    bare_to_ns: dict[str, str] = {}
+    used_names: set[str] = set()
+
     for t in tools:
         if not isinstance(t, dict):
             continue
-        if t.get("type") != "function":
+
+        # ---- namespace 容器：提升内部 function 工具 ----
+        if t.get("type") == "namespace":
+            ns_name = t.get("name", "")
+            for sub in t.get("tools") or []:
+                if not isinstance(sub, dict) or sub.get("type") != "function":
+                    continue
+                bare = sub.get("name", "")
+                if not bare or bare in used_names:
+                    obs.log(f"⚠ namespace {ns_name}: skip tool '{bare}' (empty or name collision)")
+                    continue
+                fn: dict[str, Any] = {"name": bare}
+                if sub.get("description"):
+                    fn["description"] = sub["description"]
+                if "parameters" in sub:
+                    fn["parameters"] = sub["parameters"]
+                if "strict" in sub:
+                    fn["strict"] = sub["strict"]
+                result.append({"type": "function", "function": fn})
+                bare_to_ns[bare] = ns_name
+                used_names.add(bare)
             continue
+
+        if t.get("type") != "function":
+            # 托管型工具（web_search 等）：需 OpenAI 服务端执行，丢弃并记录
+            obs.log("⚠ drop non-function tool: type=" + str(t.get("type"))
+                    + " name=" + str(t.get("name")))
+            continue
+
         # 已经是 Chat 格式（有 "function" key）
         if "function" in t:
             result.append(t)
+            used_names.add((t.get("function") or {}).get("name", ""))
             continue
+
         # Responses 扁平格式 → Chat 嵌套格式
-        fn: dict[str, Any] = {"name": t.get("name", "")}
+        fn = {"name": t.get("name", "")}
         if "description" in t:
             fn["description"] = t["description"]
         if "parameters" in t:
@@ -229,7 +480,9 @@ def _convert_tools_for_chat(tools: list) -> list:
         if "strict" in t:
             fn["strict"] = t["strict"]
         result.append({"type": "function", "function": fn})
-    return result
+        used_names.add(t.get("name", ""))
+
+    return result, bare_to_ns
 
 
 # ---------------------------------------------------------------------------
@@ -251,22 +504,27 @@ class ResponsesStreamConverter:
       yield converter.finish().encode()
     """
 
-    def __init__(self, model: str = "unknown"):
+    def __init__(self, model: str = "unknown", bare_to_ns: dict[str, str] | None = None):
         self.resp_id = _rand_id("resp_")
         self.msg_id = _rand_id("msg_")
         self.model = model
         self.created_at = int(time.time())
+        # namespace 还原映射：模型调用的裸名 → 所属 namespace（Codex MCP 路由用）
+        self.bare_to_ns = bare_to_ns or {}
 
         # 状态标记
         self._emitted_created = False
         self._emitted_msg_item = False
         self._emitted_content_part = False
+        # message item 的 output_index：动态计算，避免与先到的 function_call 冲突
+        self._msg_oi = 0
 
         # 累积内容
         self._content = ""
         self._tool_calls: dict[int, dict] = {}  # index → {id, name, args, fc_id, output_idx, emitted}
         self._finish_reason: str | None = None
         self._usage: dict | None = None
+        self._saw_done = False   # 是否见过上游的 [DONE]
 
     # ---- 公开接口 ----
 
@@ -277,6 +535,7 @@ class ResponsesStreamConverter:
             return ""
         data = line[5:].strip()
         if data == "[DONE]":
+            self._saw_done = True
             return ""
         try:
             chunk = json.loads(data)
@@ -284,23 +543,38 @@ class ResponsesStreamConverter:
             return ""
         return self._process_chunk(chunk)
 
-    def finish(self) -> str:
-        """流结束后，发出收尾事件（done + completed）。"""
+    def finish(self, error: dict | None = None, incomplete: dict | None = None) -> str:
+        """流结束后发出终止事件。
+
+        - 正常：output_text.done / content_part.done / output_item.done ×N → response.completed
+        - 上游中断或出错：统一走 response.failed（带 error），客户端才能立刻给出反馈，
+          而不是一直等一个永远不来的 response.completed。
+        - 流被上游悄悄截断（没收到 finish_reason）：走 response.incomplete。
+        """
+        if error is not None:
+            return self._evt("response.failed", {
+                "response": self._response_obj("failed", error=error)
+            })
+        if incomplete is not None:
+            return self._evt("response.incomplete", {
+                "response": self._response_obj("incomplete", incomplete_details=incomplete)
+            })
+
         events: list[str] = []
 
         # 关闭 text content
         if self._emitted_content_part:
             events.append(self._evt("response.output_text.done", {
-                "output_index": 0, "content_index": 0, "text": self._content
+                "output_index": self._msg_oi, "content_index": 0, "text": self._content
             }))
             events.append(self._evt("response.content_part.done", {
-                "output_index": 0, "content_index": 0,
+                "output_index": self._msg_oi, "content_index": 0,
                 "part": {"type": "output_text", "text": self._content, "annotations": []}
             }))
 
         if self._emitted_msg_item:
             events.append(self._evt("response.output_item.done", {
-                "output_index": 0,
+                "output_index": self._msg_oi,
                 "item": self._msg_item("completed")
             }))
 
@@ -310,7 +584,8 @@ class ResponsesStreamConverter:
             if tc.get("emitted"):
                 oi = tc["output_idx"]
                 events.append(self._evt("response.function_call_arguments.done", {
-                    "output_index": oi, "arguments": tc["args"]
+                    "item_id": tc["fc_id"], "output_index": oi,
+                    "call_id": tc["id"], "arguments": tc["args"]
                 }))
                 events.append(self._evt("response.output_item.done", {
                     "output_index": oi, "item": self._fc_item(tc, "completed")
@@ -322,8 +597,28 @@ class ResponsesStreamConverter:
         }))
         return "".join(events)
 
-    def get_nonstream_response(self) -> dict:
+    # ---- 流完整性判定 ----
+    def saw_terminal_evidence(self) -> bool:
+        """上游流是否留下了"正常结束"的证据。
+
+        Chat 后端正常收尾会给出 finish_reason 或 [DONE]；两者都没有说明流被截断
+        （连接被掐、网关超时等），此时不能把请求当成功记账。
+        """
+        return bool(self._finish_reason) or self._saw_done
+
+    def note_done(self) -> None:
+        self._saw_done = True
+
+    def has_output(self) -> bool:
+        return bool(self._content or self._tool_calls)
+
+    def get_nonstream_response(self, error: dict | None = None,
+                               incomplete: dict | None = None) -> dict:
         """流结束后获取完整的非流式 Response 对象。"""
+        if error is not None:
+            return self._response_obj("failed", error=error)
+        if incomplete is not None:
+            return self._response_obj("incomplete", incomplete_details=incomplete)
         return self._response_obj("completed")
 
     # ---- 内部 ----
@@ -354,22 +649,25 @@ class ResponsesStreamConverter:
             content = delta.get("content")
             if content:
                 if not self._emitted_msg_item:
+                    # 若 function_call 已先发出，message 的 output_index 要排在其后
+                    if self._tool_calls:
+                        self._msg_oi = max(tc["output_idx"] for tc in self._tool_calls.values()) + 1
                     events.append(self._evt("response.output_item.added", {
-                        "output_index": 0,
+                        "output_index": self._msg_oi,
                         "item": self._msg_item("in_progress", empty=True)
                     }))
                     self._emitted_msg_item = True
 
                 if not self._emitted_content_part:
                     events.append(self._evt("response.content_part.added", {
-                        "output_index": 0, "content_index": 0,
+                        "output_index": self._msg_oi, "content_index": 0,
                         "part": {"type": "output_text", "text": "", "annotations": []}
                     }))
                     self._emitted_content_part = True
 
                 self._content += content
                 events.append(self._evt("response.output_text.delta", {
-                    "output_index": 0, "content_index": 0, "delta": content
+                    "output_index": self._msg_oi, "content_index": 0, "delta": content
                 }))
 
             # ---- tool_calls delta ----
@@ -395,9 +693,6 @@ class ResponsesStreamConverter:
                     slot["name"] = fn["name"]
 
                 if not slot["emitted"]:
-                    # 确保 msg item 已发出（即使 content 为空）
-                    if not self._emitted_msg_item and (self._content or not self._tool_calls):
-                        pass  # 不需要额外处理
                     events.append(self._evt("response.output_item.added", {
                         "output_index": slot["output_idx"],
                         "item": self._fc_item(slot, "in_progress")
@@ -407,7 +702,9 @@ class ResponsesStreamConverter:
                 if fn.get("arguments"):
                     slot["args"] += fn["arguments"]
                     events.append(self._evt("response.function_call_arguments.delta", {
+                        "item_id": slot["fc_id"],
                         "output_index": slot["output_idx"],
+                        "call_id": slot["id"],
                         "delta": fn["arguments"]
                     }))
 
@@ -434,7 +731,11 @@ class ResponsesStreamConverter:
         }
 
     def _fc_item(self, tc: dict, status: str) -> dict:
-        return {
+        # call_id 兜底：部分后端的 delta 不带 id，缺了 Codex 无法回传工具结果。
+        # 直接写回 slot，保证 added/done 事件与最终 response 里一致。
+        if not tc.get("id"):
+            tc["id"] = _rand_id("call_")
+        item = {
             "type": "function_call",
             "id": tc["fc_id"],
             "call_id": tc["id"],
@@ -442,25 +743,41 @@ class ResponsesStreamConverter:
             "arguments": tc["args"],
             "status": status,
         }
+        # namespace 还原：Codex 0.117+ 据此把调用路由到对应 MCP 服务器
+        ns = self.bare_to_ns.get(tc["name"])
+        if ns:
+            item["namespace"] = ns
+        return item
 
-    def _response_obj(self, status: str) -> dict:
-        output = []
+    def _response_obj(self, status: str, error: dict | None = None,
+                      incomplete_details: dict | None = None) -> dict:
+        """按 output_index 顺序拼最终 output 数组。
+
+        早期实现按"先 message 再 function_call"固定顺序拼装，当模型先出工具调用、
+        后出结论文本时，数组顺序会与事件里声明的 output_index 不一致，
+        客户端按 output_index 取项就会错位。
+        """
+        indexed: list[tuple[int, dict]] = []
         if self._emitted_msg_item or self._content:
-            output.append(self._msg_item(status))
+            indexed.append((self._msg_oi, self._msg_item(status)))
         for idx in sorted(self._tool_calls):
             tc = self._tool_calls[idx]
             if tc.get("emitted"):
-                output.append(self._fc_item(tc, status))
+                indexed.append((tc["output_idx"], self._fc_item(tc, status)))
+        indexed.sort(key=lambda pair: pair[0])
+        output = [item for _, item in indexed]
 
         usage = None
         if self._usage:
             u = self._usage
+            pt = u.get("prompt_tokens_details") or {}
+            ct = u.get("completion_tokens_details") or {}
             usage = {
-                "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": u.get("total_tokens", 0),
+                "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)) or 0,
+                "input_tokens_details": {"cached_tokens": pt.get("cached_tokens", 0) or 0},
+                "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)) or 0,
+                "output_tokens_details": {"reasoning_tokens": ct.get("reasoning_tokens", 0) or 0},
+                "total_tokens": u.get("total_tokens", 0) or 0,
             }
 
         return {
@@ -468,8 +785,13 @@ class ResponsesStreamConverter:
             "object": "response",
             "created_at": self.created_at,
             "status": status,
+            "error": error,
+            "incomplete_details": incomplete_details,
             "model": self.model,
             "output": output,
             "parallel_tool_calls": True,
+            "store": False,
+            "metadata": {},
+            "truncation": "disabled",
             "usage": usage,
         }

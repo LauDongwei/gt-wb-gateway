@@ -74,7 +74,7 @@ curl http://127.0.0.1:8787/v1/models   # model list
 curl http://127.0.0.1:8787/status      # cooldown / circuit-breaker state
 ```
 
-Run the test suite (53 offline assertions covering the state machine and session parsing):
+Run the test suite (89 offline assertions covering the state machine, session parsing and protocol hardening):
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -213,10 +213,21 @@ Codex / Claude Code system prompts naturally contain words like `sandbox`, `cred
 `escalation`, `exploit`, which the backend's filter misreads. Three layers of protection
 are enabled by default:
 
-1. **Zero-width desensitization** — inserts zero-width spaces into sensitive words;
+1. **Identity neutralization** — rewrites "I am the X CLI" identity claims into neutral
+   phrasing. Measured to be the **sole trigger** of the upstream `code 11128` security
+   policy; touching only the identity while preserving behavioral instructions verbatim
+   keeps the operating manual intact *and* passes the filter (a 47,140-char request
+   returns 200 on the first attempt);
+2. **Zero-width desensitization** — inserts zero-width spaces into sensitive words;
    invisible to humans, breaks the filter's keyword matching;
-2. **Harness compression** — compresses the verbose agent runtime prompt into a summary;
-3. **Retry on hit** — detects `content-filter` and automatically retries once in compact mode.
+3. **Retry on hit** — detects `content-filter` and retries once in compact mode
+   (fallback only; normally never triggered).
+
+> Earlier versions passed the filter by *compressing the harness prompt into a summary*.
+> The cost: Codex instructions shrank from 21,026 chars to 173, and every tool description
+> was wiped — the model lost its operating manual and stopped calling tools properly.
+> **That was the real reason function calling "didn't work"**, now replaced by
+> identity-only neutralization.
 
 To keep the full original system prompt, pass `--no-compact` (higher false-block rate;
 layer 3 kicks in automatically when that happens).
@@ -253,12 +264,13 @@ These are measured results against the **real backend**, not paper claims:
 | `/v1/chat/completions` non-streaming + tool calls | ✅ 200, `finish=tool_calls`, args round-trip correctly |
 | `/v1/responses` non-streaming + streaming | ✅ complete Codex event sequence (created → in_progress → delta → done) |
 | `/v1/messages` non-streaming + streaming | ✅ `content_block_start` / `text_delta` / `stop` events all present |
-| Test suites | ✅ 53 offline assertions + 24 online smoke tests, all green |
+| Test suites | ✅ 89 offline assertions, all green |
 | LAN / ZeroTier real calls | ✅ real model calls succeed remotely; external `/health` auto-desensitized |
 | Scheduled task + two-layer self-healing | ✅ process-level recovery in **14.8s**; full-tree crash recovered by watchdog in **5.3s** |
 | Idempotent launcher guard | ✅ duplicate start exits in **0.2s** when healthy — no port grabbing, no hot loop |
 | CC Switch deep-link import + end-to-end | ✅ import landed; `codex exec` with the imported config returned `GTWB-CCSW-OK` |
-| Codex CLI real run | ✅ tool-call loop closed + multi-turn agent loop (5 round-trips, projection compression `25227 → 436` chars) |
+| Codex CLI real run | ✅ multi-step agent end-to-end (read file → analyse → write artifact); tool-call loop closed, parallel tool calls working, **zero escalation retries** |
+| Long-context fidelity | ✅ a 693,834-char session retains **53.3%** and the model still answers both the opening task and recent config (old build: 2.2%) |
 
 ---
 
@@ -338,7 +350,7 @@ gt-wb-gateway/
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch integration methods + protocol notes (Chinese)
 │   └── 双机共享-家里电脑.md    ZeroTier two-machine setup / firewall / stability / risk lines (Chinese)
-├── tests/                test suites (53 offline assertions + 24 online smoke tests)
+├── tests/                test suite (89 offline assertions)
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

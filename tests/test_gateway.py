@@ -242,7 +242,7 @@ def test_protocol_adapters() -> None:
     from gtwb.responses_projection import project_responses_chat_body
     from gtwb.anthropic_adapter import anthropic_request_to_chat
 
-    chat = responses_request_to_chat(
+    chat, _bare_to_ns = responses_request_to_chat(
         {
             "model": "glm-5.3",
             "instructions": "你是助手",
@@ -263,6 +263,208 @@ def test_protocol_adapters() -> None:
     check("Anthropic → Chat 产出 messages", bool(a.get("messages")))
 
 
+def test_hardening():
+    """2026-09-19 硬化批次：无损脱敏、弹性上下文预算、流完整性、模型名兜底。"""
+    import asyncio
+
+    from gtwb import responses_adapter as RA
+    from gtwb import responses_projection as RP
+    from gtwb import desensitize as DS
+    from gtwb import server as SV
+
+    print("\n[无损脱敏]")
+    codex_instructions = (
+        "You are a coding agent running in the Codex CLI. "
+        + "Follow the repository conventions carefully. " * 400
+    )
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "description": "Run a shell command in the workspace.",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+    }]
+    body = {"messages": [{"role": "system", "content": codex_instructions},
+                         {"role": "user", "content": "hello"}],
+            "tools": tools}
+
+    lossless = DS.desensitize_body(body, roles=("system", "developer"),
+                                   desensitize_harness_user=True, desensitize_tools=True,
+                                   compact_harness=False, strip_tool_metadata=False,
+                                   prune_runtime=False)
+    sys_out = lossless["messages"][0]["content"]
+    check("无损档保留系统提示词全文",
+          len(sys_out) >= len(codex_instructions),
+          f"{len(codex_instructions)} → {len(sys_out)}")
+    check("无损档保留工具描述",
+          lossless["tools"][0]["function"].get("description") ==
+          tools[0]["function"]["description"])
+
+    # 身份中和：无损档必须只动"我是谁"，不动"做什么"。
+    check("无损档中和 Codex CLI 身份声明",
+          "Codex CLI" not in sys_out,
+          "身份句已改写为中性表述")
+    check("无损档保留行为指令正文",
+          sys_out.count("Follow the repository conventions carefully.") == 400,
+          "400 条行为指令逐字保留")
+    check("身份中和后可再次调用（参数不遮蔽函数）",
+          callable(getattr(DS, "neutralize_identity_text", None)),
+          "neutralize_identity_text 可调用")
+
+    hard = DS.desensitize_body(body, roles=("system", "developer"),
+                               desensitize_harness_user=True, desensitize_tools=True,
+                               compact_harness=True, strip_tool_metadata=True,
+                               prune_runtime=True)
+    check("降级档才压缩系统提示词",
+          len(hard["messages"][0]["content"]) < len(codex_instructions) * 0.05)
+    check("降级档才清空工具描述",
+          not hard["tools"][0]["function"].get("description"))
+
+    print("\n[弹性上下文预算]")
+    check("透明阈值已上调到 ≥400k 字符", RP.TRANSPARENT_CHAR_LIMIT >= 400_000)
+
+    small = [{"role": "user", "content": "x" * 5_000}]
+    _, meta_small = RP.project_responses_chat_body({"messages": small})
+    check("阈值内走透明档", meta_small.get("mode") == "transparent", str(meta_small.get("mode")))
+
+    big_msgs = [{"role": "system", "content": codex_instructions}]
+    for i in range(300):
+        big_msgs.append({"role": "assistant", "content": f"step {i} " + "y" * 2_000})
+        big_msgs.append({"role": "tool", "tool_call_id": f"c{i}",
+                         "content": f"result {i} " + "z" * 2_000})
+    big_msgs.append({"role": "user", "content": "继续"})
+    _, meta_big = RP.project_responses_chat_body({"messages": big_msgs, "tools": []})
+
+    orig = meta_big.get("original_message_chars") or 0
+    kept = meta_big.get("projected_message_chars") or 0
+    check("超阈值进入弹性档", meta_big.get("mode") == "elastic", str(meta_big.get("mode")))
+    check("不再把长会话压成个位数百分比",
+          kept >= 100_000 and kept >= orig * 0.15,
+          f"{orig} → {kept}")
+    check("压缩档保留真实系统提示词",
+          any(m.get("role") == "system" and len(str(m.get("content", ""))) > 5_000
+              for m in RP.project_responses_chat_body({"messages": big_msgs, "tools": []})[0]["messages"]))
+
+    print("\n[请求字段透传]")
+    chat, _ = RA.responses_request_to_chat({
+        "model": "m", "instructions": "i",
+        "input": [{"role": "user", "content": "hi"}],
+        "reasoning": {"effort": "high", "summary": "auto"},
+        "prompt_cache_key": "abc123",
+    })
+    check("嵌套 reasoning.effort 映射到 reasoning_effort", chat.get("reasoning_effort") == "high")
+    check("prompt_cache_key 透传", chat.get("prompt_cache_key") == "abc123")
+    check("prompt_cache_key 在 Chat 直通白名单里", "prompt_cache_key" in SV.PASSTHROUGH_KEYS)
+
+    print("\n[工具输出图片]")
+    text_out, urls = RA._split_tool_output_images([
+        {"type": "input_text", "text": "screenshot taken"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+    ])
+    check("图片被摘出为 URL 列表", urls == ["data:image/png;base64,AAAA"])
+    check("文本部分不含 base64", "AAAA" not in text_out)
+
+    print("\n[流完整性]")
+    conv = RA.ResponsesStreamConverter(model="m")
+    conv.feed_line('data: {"choices":[{"delta":{"content":"hi"}}]}')
+    check("未见 finish_reason 时不算正常收尾", conv.saw_terminal_evidence() is False)
+    conv.note_done()
+    check("见到 [DONE] 后算正常收尾", conv.saw_terminal_evidence() is True)
+    failed = conv.finish(error={"code": "upstream_stream_error", "message": "boom"})
+    check("可发出 response.failed", "response.failed" in failed)
+    inc = conv.finish(incomplete={"reason": "upstream_truncated"})
+    check("可发出 response.incomplete", "response.incomplete" in inc)
+
+    print("\n[output_index 一致性]")
+    conv2 = RA.ResponsesStreamConverter(model="m")
+    conv2.feed_line('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"exec_command","arguments":"{}"}}]}}]}')
+    conv2.feed_line('data: {"choices":[{"delta":{"content":"done"}}]}')
+    obj = conv2.get_nonstream_response()
+    indexes = [it.get("id") for it in obj["output"]]
+    check("先工具后文本时 output 顺序不乱",
+          [it["type"] for it in obj["output"]] == ["function_call", "message"],
+          str([it["type"] for it in obj["output"]]))
+    check("output 非空", bool(indexes))
+
+    print("\n[错误码归正]")
+    check("NETWORK → 502", SV._status_for_kind(SV.ErrKind.NETWORK) == 502)
+    check("SERVER → 502", SV._status_for_kind(SV.ErrKind.SERVER) == 502)
+    check("SOFT_RATE → 429", SV._status_for_kind(SV.ErrKind.SOFT_RATE) == 429)
+    check("AUTH → 401", SV._status_for_kind(SV.ErrKind.AUTH) == 401)
+
+    print("\n[记账自洽]")
+    # 回归动机：2026-09-19 新增 escalated 字段时漏了 __init__ 赋值，
+    # 结果是每个请求在收尾记账时 500，而日志里只看到 ▶ 没有 ◀。这里把
+    # 「fresh RequestStat 走完 done()」固化下来，任何字段漏定义都会当场失败。
+    from gtwb import obs as OBS
+    st = OBS.RequestStat("m", "RESPONSES", "rid0")
+    st.uid8 = "abcdef12"
+    st.status = 200
+    st.elapsed = 1.0
+    st.tokens = 12
+    st.usage = {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "completion_tokens_details": {"reasoning_tokens": 0}}
+    st.tool_calls = ["exec_command"]
+    st.finish = "tool_calls"
+    st.first_byte()
+    st.done()
+    check("RequestStat.done() 全字段自洽（不再 AttributeError）", True)
+
+    print("\n[模型名兜底]")
+    cfg = Config(api_key="", model_fallback="deepseek-v4.1-flash",
+                 model_aliases={"gpt-5.6-luna": "glm-5.3"})
+    gw = SV.Gateway.__new__(SV.Gateway)
+    gw.cfg = cfg
+
+    async def _ids():
+        return ["deepseek-v4.1-flash", "glm-5.3"]
+
+    gw.model_ids = _ids
+
+    async def _probe():
+        alias = await gw.resolve_model("gpt-5.6-luna")
+        unknown = await gw.resolve_model("gpt-6-astra")
+        known = await gw.resolve_model("deepseek-v4.1-flash")
+        empty = await gw.resolve_model("")
+        return alias, unknown, known, empty
+
+    alias, unknown, known, empty = asyncio.run(_probe())
+    check("别名命中", alias[0] == "glm-5.3", str(alias))
+    check("未知模型落到兜底", unknown[0] == "deepseek-v4.1-flash", str(unknown))
+    check("已知模型原样放行", known == ("deepseek-v4.1-flash", ""), str(known))
+    check("空模型名不处理", empty == ("", ""), str(empty))
+
+    cfg2 = Config(api_key="")   # 未配置别名/兜底 → 零开销直通
+    gw2 = SV.Gateway.__new__(SV.Gateway)
+    gw2.cfg = cfg2
+
+    async def _boom():
+        raise AssertionError("不应查模型表")
+
+    gw2.model_ids = _boom
+    check("未启用时不查模型表", asyncio.run(gw2.resolve_model("whatever")) == ("whatever", ""))
+
+    print("\n[诊断抓包]")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+
+        class _Cfg:
+            capture_dir = td
+
+        SV._capture(_Cfg(), "responses", {"model": "m", "input": []})
+        got = os.listdir(td)
+        check("抓包确实写出文件（不再被静默吞掉）", len(got) == 1, str(got))
+        if got:
+            import json as _json
+            with open(os.path.join(td, got[0]), encoding="utf-8") as f:
+                written = _json.load(f)
+            check("抓包内容与请求体一致", written.get("model") == "m")
+        check("未配置 capture_dir 时不写盘", SV._capture(Config(api_key=""), "responses", {}) is None)
+
+
 def main() -> int:
     test_classify()
     test_next_hour()
@@ -270,6 +472,7 @@ def main() -> int:
     test_auth_parse()
     test_model_extraction()
     test_protocol_adapters()
+    test_hardening()
 
     print("\n" + "═" * 56)
     print(f"通过 {PASS} 项，失败 {len(FAIL)} 项")

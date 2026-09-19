@@ -4,23 +4,28 @@ responses_projection — /v1/responses 的后端投影层。
 目标
 ----
 Codex CLI 会把大量运行时提示、完整工具 schema、长历史、以及工具输出一并塞进
-/v1/responses 请求里。腾讯后端对这类 agentic payload 很容易触发内容审核，或者
-因为上下文过长而表现不稳定。
+/v1/responses 请求里。我们希望在保住 agent 能继续干活的前提下，把请求压到
+后端稳定接受的规模。
 
-本模块在保持外部 OpenAI Responses 兼容的前提下，只对发往后端的 Chat body 做
-"最小语义闭包"投影：
+三档策略
+--------
+1. **透明档**：消息字符 ≤ `TRANSPARENT_CHAR_LIMIT` → 完全原样透传，只补语言规则。
+2. **弹性档**（压缩默认档）：超过阈值 → 按比例分配保留额度（`_message_budget`），
+   最近的消息逐字保留，更早的压成摘要；**不动**系统提示词与工具描述。
+3. **退化档**：`desensitize(force_compact=True)` 路径（仅命中审核后重试时使用），
+   才会把系统提示词摘要化、丢 harness 消息。
 
-- 固定短 system 摘要替换 Codex/Claude Code harness
-- 保留最新用户意图
-- 保留最近一段真实 assistant/tool 链路
-- 把更早历史压缩成规则摘要
-- 把 tool schema 收敛成结构字段
-- 把超长 tool output / tool arguments 压缩成可继续推理的摘要
+历史教训（2026-09-19 实测）
+-------------------------
+早期是"二元开关"：>120k 字符就压到 ~6k 字符。Mac 端长会话实测 671k → 5.8k，
+模型失去全部历史与操作手册，agent loop 反复重跑同一命令、不收敛。
+同批证据还显示上游能接受 ≥877k 字符的载荷，"必须牺牲上下文"并不成立。
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 
@@ -61,24 +66,105 @@ HARNESS_SYSTEM_MARKERS = (
 )
 
 BASE_SYSTEM_PROMPT = (
-    "You are a coding assistant serving an OpenAI-compatible CLI. "
+    "You are a coding assistant serving an OpenAI-compatible coding client (desktop app or CLI). "
     "Be precise, concise, safe, and action-oriented. "
+    "Always respond in the same language the user writes in. "
     "Use available tools when needed, follow repository instructions and durable user context, "
     "and continue from the preserved recent context. "
     "If earlier history was condensed, rely on the preserved recent messages and rerun tools when exact old details are required."
 )
 
+# 语言跟随：上下文经投影压缩后英文脚手架密度高，模型容易跟英文走，
+# 这里根据最后一条用户消息显式指定回复语言（CJK 才注入，英文等默认不干预）
+def _detect_user_language(messages: list[dict]) -> str:
+    """从最后一条用户消息检测 CJK 语言；非 CJK 返回空串。"""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            text = _content_to_text(msg.get("content", ""))
+            if not text:
+                continue
+            zh = sum('\u4e00' <= c <= '\u9fff' for c in text)
+            ja = sum('\u3040' <= c <= '\u30ff' for c in text)
+            ko = sum('\uac00' <= c <= '\ud7af' for c in text)
+            if zh == ja == ko == 0:
+                return ""
+            if ja > zh and ja >= ko:
+                return "Japanese (日本語)"
+            if ko > zh and ko > ja:
+                return "Korean (한국어)"
+            return "Chinese (简体中文)"
+    return ""
+
+
+def _language_rule(messages: list[dict]) -> str:
+    lang = _detect_user_language(messages)
+    if not lang:
+        return ""
+    return (
+        "LANGUAGE RULE: Write ALL your output in " + lang + " — including any text "
+        "before or between tool calls. Never use any other language."
+    )
+
+
+def _append_language_rule(system_content: str, rule: str) -> str:
+    return system_content + "\n\n" + rule if rule else system_content
+
+
+def _append_tail_language_note(messages: list[dict], lang: str) -> None:
+    """在最后一条用户消息尾部追加就近语言提示。
+
+    开头的 system 级语言规则对「要调工具」的回复约束力弱（模型常用英文写
+    工具调用前的开场白），尾部就近提示实测约束力强得多。
+    """
+    if not lang:
+        return
+    note = f"\n\n[MANDATORY: Write all your text in {lang}, including text before tool calls.]"
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                m["content"] = c + note
+            elif isinstance(c, list):
+                for part in reversed(c):
+                    if isinstance(part, dict) and part.get("type") in ("text", "input_text", "output_text"):
+                        part["text"] = part.get("text", "") + note
+                        break
+            return
+
 HISTORY_PREFIX = "Earlier conversation summary (condensed):"
 
-MAX_SYSTEM_GUIDANCE_CHARS = 1200
-MAX_USER_CHARS = 3200
-MAX_ASSISTANT_CHARS = 1800
-MAX_TOOL_OUTPUT_CHARS = 1600
-MAX_TOOL_ARGS_CHARS = 900
-MAX_HISTORY_SUMMARY_CHARS = 2200
-MAX_HISTORY_ITEMS = 10
-MAX_TAIL_MESSAGES = 8
-MAX_TAIL_CHARS = 7000
+# ── 上下文预算（弹性，替代早期"二元开关"）──────────────────────────────────
+#
+# 早期实现：字符数 ≤120k 原样透传，一旦超过就压到 ~6k 字符（丢 99%）。
+# 实测后果：Mac 端 Codex 的长会话（671k 字符）每轮被压成 5.8k 字符，
+# 模型失去全部历史与操作手册 → 反复重跑同一命令、agent loop 不收敛。
+#
+# 实测上游 /v2/chat/completions 接受 ≥877k 字符（≈22 万 token）的载荷并返回 200，
+# 说明"上下文过长"并不是必须牺牲上下文的理由。
+#
+# 新策略：
+#   1) 消息字符 ≤ TRANSPARENT_CHAR_LIMIT → 完全原样透传（只加语言规则）
+#   2) 超过 → 按比例保留（KEEP_RATIO），下限 MIN_MESSAGE_BUDGET，
+#      且"消息 + 工具"总量不超过 TOTAL_CHAR_CEILING
+#   3) 保留时优先保最近的消息（逐字完整），更早的才压缩成摘要
+TRANSPARENT_CHAR_LIMIT = 600_000
+TOTAL_CHAR_CEILING = 800_000
+KEEP_RATIO = 0.6
+MIN_MESSAGE_BUDGET = 100_000
+SUMMARY_SHARE = 0.25          # 预算里分给"历史摘要"的比例，其余给最近的完整消息
+
+# 单条消息/单块内容的截断上限。数值偏大是刻意的：Codex 的 instructions
+# 有 2 万字符左右，工具描述是模型选对工具的唯一依据，都不能按"摘要"对待。
+MAX_SYSTEM_GUIDANCE_CHARS = 24_000
+MAX_USER_CHARS = 24_000
+MAX_ASSISTANT_CHARS = 12_000
+MAX_TOOL_OUTPUT_CHARS = 8_000
+MAX_TOOL_ARGS_CHARS = 4_000
+MAX_HISTORY_SUMMARY_CHARS = 40_000
+MAX_HISTORY_ITEMS = 60
+MAX_HISTORY_LINE_CHARS = 400
+MAX_TAIL_MESSAGES = 400
+MAX_TAIL_CHARS = 400_000
 
 SCHEMA_KEEP_KEYS = {
     "type",
@@ -113,9 +199,49 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
     elif "tools" in projected:
         projected["tools"] = []
 
+    lang_rule = _language_rule(messages)
+
+    # ---- 透明模式：上下文在安全阈值内时原样透传，模型看到的就是 Codex 发的 ----
+    # （学习 sub2api：网关不改写对话内容，模型才能发挥原有水准）
+    if _messages_size(messages) <= TRANSPARENT_CHAR_LIMIT:
+        transparent_msgs = messages
+        if lang_rule:
+            applied = False
+            for m in transparent_msgs:
+                if isinstance(m, dict) and m.get("role") == "system":
+                    m["content"] = _append_language_rule(m.get("content", ""), lang_rule)
+                    applied = True
+                    break
+            if not applied:
+                transparent_msgs = [{"role": "system", "content": lang_rule}] + transparent_msgs
+        _append_tail_language_note(transparent_msgs, _detect_user_language(messages))
+        projected["messages"] = transparent_msgs
+        projected["tools"] = tools  # 完整 schema + description，不做任何剪枝
+        return projected, {
+            "mode": "transparent",
+            "aggressive": False,
+            "original_messages": len(messages),
+            "projected_messages": len(transparent_msgs),
+            "original_message_chars": _messages_size(messages),
+            "projected_message_chars": _messages_size(transparent_msgs),
+            "original_tools": len(tools),
+            "projected_tools": len(tools),
+            "original_tool_chars": _tools_size(tools),
+            "projected_tool_chars": _tools_size(tools),
+        }
+
     aggressive = _looks_like_agentic_cli(messages, tools)
     if not aggressive:
-        projected["messages"] = _project_messages_conservative(messages)
+        conservative_msgs = _project_messages_conservative(messages)
+        if lang_rule:
+            for m in conservative_msgs:
+                if isinstance(m, dict) and m.get("role") == "system":
+                    m["content"] = _append_language_rule(m.get("content", ""), lang_rule)
+                    break
+            else:
+                conservative_msgs.insert(0, {"role": "system", "content": lang_rule})
+        _append_tail_language_note(conservative_msgs, _detect_user_language(messages))
+        projected["messages"] = conservative_msgs
         return projected, {
             "mode": "conservative",
             "aggressive": False,
@@ -126,10 +252,16 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
             **tool_stats,
         }
 
+    # ---- 压缩档：不再"一刀切砸成 6k"，而是按比例分配保留额度 ----
+    budget = _message_budget(_messages_size(messages), tool_stats.get("projected_tool_chars", 0))
+    tail_budget = max(int(budget * (1 - SUMMARY_SHARE)), 8_000)
+    summary_budget = max(budget - tail_budget, 4_000)
+
     tool_name_by_call_id = _build_tool_call_name_map(messages)
-    preserved_guidance: list[str] = []
+    system_messages: list[dict] = []      # 真实系统提示词（Codex instructions / 仓库指令）
     conversation: list[dict] = []
     dropped_harness_messages = 0
+    first_task_idx: int | None = None     # 第一条"真正的用户任务"
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -138,17 +270,28 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
         text = _content_to_text(msg.get("content", ""))
 
         if role == "system":
-            if _looks_like_harness_system(text):
+            # 只在"退化档"（force_compact）里才把系统提示词摘要化；
+            # 常规压缩档必须原样保留，否则模型失去工具使用规范。
+            if _looks_like_harness_system(text) and os.environ.get("GTWB_DROP_HARNESS") == "1":
                 dropped_harness_messages += 1
                 continue
             guidance = _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS)
             if guidance:
-                preserved_guidance.append(guidance)
+                system_messages.append({"role": "system", "content": guidance})
             continue
 
         if role == "user" and _looks_like_harness_user(text):
-            dropped_harness_messages += 1
+            # harness 注入的 user 消息（AGENTS.md / environment_context）承载仓库规范，
+            # 压缩档同样保留（截断），只有显式要求时才丢。
+            truncated = _truncate_text(text, MAX_USER_CHARS)
+            if truncated:
+                conversation.append({"role": "user", "content": truncated})
+            else:
+                dropped_harness_messages += 1
             continue
+
+        if role == "user" and first_task_idx is None:
+            first_task_idx = len(conversation)
 
         projected_msg = _project_conversation_message(msg)
         if projected_msg is not None:
@@ -157,10 +300,16 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
     if not conversation:
         conversation = _project_messages_conservative(messages)
 
-    tail_start = _choose_tail_start(conversation)
+    tail_start = _choose_tail_start(conversation, tail_budget)
     tail_start = _expand_tail_for_tool_context(conversation, tail_start)
     latest_user_idx = _latest_user_index(conversation)
 
+    # 锚点一：原始任务陈述。agent 会话再长，用户的原始诉求都不能丢。
+    anchor_task = None
+    if first_task_idx is not None and first_task_idx < tail_start:
+        anchor_task = dict(conversation[first_task_idx])
+
+    # 锚点二：窗口之前的最后一条用户消息（最新意图）
     anchor_user = None
     if latest_user_idx is not None and latest_user_idx < tail_start:
         anchor_user = dict(conversation[latest_user_idx])
@@ -169,31 +318,43 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
     for idx, msg in enumerate(conversation):
         if idx >= tail_start:
             break
-        if latest_user_idx is not None and idx == latest_user_idx and anchor_user is not None:
+        if anchor_user is not None and latest_user_idx is not None and idx == latest_user_idx:
+            continue
+        if anchor_task is not None and idx == first_task_idx:
             continue
         omitted.append(msg)
 
-    final_messages: list[dict] = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
-    guidance_message = _merge_guidance_messages(preserved_guidance)
-    if guidance_message:
-        final_messages.append({"role": "system", "content": guidance_message})
+    # 没有真实系统提示词时才补我们自己的中性基础提示词
+    if system_messages:
+        final_messages: list[dict] = list(system_messages)
+        if lang_rule:
+            first = final_messages[0]
+            first["content"] = _append_language_rule(first.get("content", ""), lang_rule)
+    else:
+        final_messages = [{"role": "system", "content": _append_language_rule(BASE_SYSTEM_PROMPT, lang_rule)}]
 
-    history_summary = _build_history_summary(omitted, tool_name_by_call_id)
+    history_summary = _build_history_summary(omitted, tool_name_by_call_id, summary_budget)
     if history_summary:
         final_messages.append({"role": "system", "content": history_summary})
 
+    if anchor_task is not None:
+        final_messages.append(anchor_task)
     if anchor_user is not None:
         final_messages.append(anchor_user)
 
     final_messages.extend(conversation[tail_start:])
+    final_messages = _ensure_tool_pairing(final_messages)
+    _append_tail_language_note(final_messages, _detect_user_language(messages))
     projected["messages"] = final_messages
 
     return projected, {
-        "mode": "aggressive",
+        "mode": "elastic",
         "aggressive": True,
+        "budget_chars": budget,
         "dropped_harness_messages": dropped_harness_messages,
-        "preserved_guidance_messages": len(preserved_guidance),
+        "preserved_system_messages": len(system_messages),
         "summarized_history_messages": len(omitted),
+        "anchor_task_preserved": anchor_task is not None,
         "anchor_user_preserved": anchor_user is not None,
         "tail_messages": len(conversation[tail_start:]),
         "original_messages": len(messages),
@@ -202,6 +363,13 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
         "projected_message_chars": _messages_size(final_messages),
         **tool_stats,
     }
+
+
+def _message_budget(message_chars: int, tool_chars: int) -> int:
+    """弹性预算：按比例保留，同时给工具 schema 留出空间，总量不超天花板。"""
+    room = max(TOTAL_CHAR_CEILING - max(tool_chars, 0), MIN_MESSAGE_BUDGET)
+    scaled = int(message_chars * KEEP_RATIO)
+    return max(MIN_MESSAGE_BUDGET, min(room, scaled))
 
 
 def _looks_like_agentic_cli(messages: list[dict], tools: list[dict]) -> bool:
@@ -231,6 +399,13 @@ def _project_messages_conservative(messages: list[dict]) -> list[dict]:
     return out
 
 
+def _extract_images(content: Any) -> list[dict]:
+    """收集 chat content 里的 image_url 图片块（投影时保真透传）。"""
+    if not isinstance(content, list):
+        return []
+    return [b for b in content if isinstance(b, dict) and b.get("type") == "image_url"]
+
+
 def _project_conversation_message(msg: dict, conservative: bool = False) -> dict | None:
     if not isinstance(msg, dict):
         return None
@@ -244,8 +419,19 @@ def _project_conversation_message(msg: dict, conservative: bool = False) -> dict
         return out
 
     if role == "user":
-        text = _content_to_text(msg.get("content", ""))
-        out["content"] = _truncate_text(text, MAX_USER_CHARS)
+        content = msg.get("content", "")
+        images = _extract_images(content)
+        text = _content_to_text(content)
+        if images:
+            # 带图消息：文本截断后与图片一起以多模态 parts 透传，绝不能丢图
+            parts: list[dict] = []
+            text = _truncate_text(text, MAX_USER_CHARS)
+            if text:
+                parts.append({"type": "text", "text": text})
+            parts.extend(images)
+            out["content"] = parts
+        else:
+            out["content"] = _truncate_text(text, MAX_USER_CHARS)
         return out
 
     if role == "assistant":
@@ -283,13 +469,61 @@ def _project_tool_call(tool_call: dict) -> dict | None:
     arguments = function.get("arguments", "")
 
     return {
-        "id": tool_call.get("id"),
+        "id": tool_call.get("id") or "call_" + _rand_suffix(),
         "type": tool_call.get("type", "function"),
         "function": {
             "name": name,
             "arguments": _summarize_tool_arguments(name, arguments),
         },
     }
+
+
+def _rand_suffix() -> str:
+    import os
+    return os.urandom(6).hex()
+
+
+def _ensure_tool_pairing(messages: list[dict]) -> list[dict]:
+    """保障 assistant(tool_calls) 与 tool 结果消息的配对完整性（Chat 协议硬约束）。
+
+    - assistant 声明了 tool_calls 但结果被上下文裁掉 → 补占位 tool 消息，避免后端 400
+    - tool 消息找不到声明对应 call_id 的 assistant → 丢弃孤儿，避免"无源之果"
+    """
+    out: list[dict] = []
+    pending: list[str] = []   # 当前 assistant 声明、尚未应答的 call_id
+    answered: set[str] = set()
+
+    def _flush_missing():
+        for cid in pending:
+            if cid not in answered:
+                out.append({"role": "tool", "tool_call_id": cid,
+                            "content": "[tool output omitted from context]"})
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            if pending:
+                _flush_missing()
+            out.append(msg)
+            pending = [tc.get("id") for tc in msg["tool_calls"]
+                       if isinstance(tc, dict) and tc.get("id")]
+            answered = set()
+            continue
+        if role == "tool":
+            cid = msg.get("tool_call_id")
+            if cid in pending and cid not in answered:
+                out.append(msg)
+                answered.add(cid)
+            continue
+        if pending:
+            _flush_missing()
+            pending, answered = [], set()
+        out.append(msg)
+    if pending:
+        _flush_missing()
+    return out
 
 
 def _summarize_tool_arguments(name: str, arguments: Any) -> str:
@@ -360,6 +594,12 @@ def _project_tools(tools: list[dict]) -> tuple[list[dict], dict]:
             continue
 
         projected_function: dict[str, Any] = {"name": name}
+        # 保留工具描述（截断控 token）：模型需要 description 才知道工具用途，
+        # 尤其是提升后的 MCP namespace 工具（如 computer use / node_repl），
+        # 纯名字+裸 schema 模型不会调用
+        desc = function.get("description")
+        if desc:
+            projected_function["description"] = desc[:500]
         if "parameters" in function:
             projected_function["parameters"] = _project_schema(function.get("parameters"))
         if "strict" in function:
@@ -405,9 +645,17 @@ def _project_schema(schema: Any, depth: int = 0) -> Any:
     return schema
 
 
-def _choose_tail_start(messages: list[dict]) -> int:
+def _choose_tail_start(messages: list[dict], budget_chars: int | None = None) -> int:
+    """从尾部向前累计，直到用满预算 —— 返回仍可"逐字保留"的起始下标。
+
+    早期实现用固定 7000 字符 / 8 条消息，长会话下等于把历史整体丢掉；
+    现在额度由调用方按输入规模算出来（见 _message_budget）。
+    """
     if not messages:
         return 0
+
+    limit_chars = max(int(budget_chars if budget_chars is not None else MAX_TAIL_CHARS), 1_000)
+    limit_msgs = max(MAX_TAIL_MESSAGES, 1)
 
     start = len(messages) - 1
     total_chars = 0
@@ -415,7 +663,7 @@ def _choose_tail_start(messages: list[dict]) -> int:
 
     for idx in range(len(messages) - 1, -1, -1):
         cost = _message_cost(messages[idx])
-        if kept > 0 and (kept >= MAX_TAIL_MESSAGES or total_chars + cost > MAX_TAIL_CHARS):
+        if kept > 0 and (kept >= limit_msgs or total_chars + cost > limit_chars):
             break
         start = idx
         total_chars += cost
@@ -460,16 +708,19 @@ def _latest_user_index(messages: list[dict]) -> int | None:
     return None
 
 
-def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str, str]) -> str:
+def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str, str],
+                           budget_chars: int | None = None) -> str:
+    """把被挤出窗口的早期消息压成摘要行。额度由调用方按输入规模分配。"""
     lines: list[str] = []
     total_chars = 0
     summarized = 0
+    char_limit = max(int(budget_chars if budget_chars is not None else MAX_HISTORY_SUMMARY_CHARS), 2_000)
 
     for msg in messages:
         line = _history_line(msg, tool_name_by_call_id)
         if not line:
             continue
-        if summarized >= MAX_HISTORY_ITEMS or total_chars + len(line) > MAX_HISTORY_SUMMARY_CHARS:
+        if summarized >= MAX_HISTORY_ITEMS or total_chars + len(line) > char_limit:
             break
         lines.append(f"- {line}")
         total_chars += len(line)
@@ -487,9 +738,10 @@ def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str,
 def _history_line(msg: dict, tool_name_by_call_id: dict[str, str]) -> str:
     role = msg.get("role")
     text = _content_to_text(msg.get("content", ""))
+    cap = MAX_HISTORY_LINE_CHARS
 
     if role == "user":
-        return f"User asked: {_truncate_text(text, 220)}"
+        return f"User asked: {_truncate_text(text, cap)}"
 
     if role == "assistant":
         tool_names = [
@@ -499,11 +751,11 @@ def _history_line(msg: dict, tool_name_by_call_id: dict[str, str]) -> str:
         ]
         tool_names = [name for name in tool_names if name]
         if text and tool_names:
-            return f"Assistant replied: {_truncate_text(text, 160)} Then called tools: {', '.join(tool_names[:4])}."
+            return f"Assistant replied: {_truncate_text(text, cap)} Then called tools: {', '.join(tool_names[:6])}."
         if tool_names:
-            return f"Assistant called tools: {', '.join(tool_names[:4])}."
+            return f"Assistant called tools: {', '.join(tool_names[:6])}."
         if text:
-            return f"Assistant replied: {_truncate_text(text, 180)}"
+            return f"Assistant replied: {_truncate_text(text, cap)}"
         return ""
 
     if role == "tool":
@@ -512,7 +764,7 @@ def _history_line(msg: dict, tool_name_by_call_id: dict[str, str]) -> str:
         return f"Tool {tool_name} returned: {summary}"
 
     if role == "system":
-        return f"System guidance: {_truncate_text(text, 180)}"
+        return f"System guidance: {_truncate_text(text, cap)}"
 
     return ""
 
@@ -530,26 +782,6 @@ def _build_tool_call_name_map(messages: list[dict]) -> dict[str, str]:
             if call_id and name:
                 mapping[call_id] = name
     return mapping
-
-
-def _merge_guidance_messages(messages: list[str]) -> str:
-    merged: list[str] = []
-    total = 0
-    for message in messages[:2]:
-        text = message.strip()
-        if not text:
-            continue
-        if total + len(text) > MAX_SYSTEM_GUIDANCE_CHARS:
-            text = _truncate_text(text, MAX_SYSTEM_GUIDANCE_CHARS - total)
-        merged.append(text)
-        total += len(text)
-        if total >= MAX_SYSTEM_GUIDANCE_CHARS:
-            break
-    if not merged:
-        return ""
-    if len(merged) == 1:
-        return merged[0]
-    return "Additional instructions:\n" + "\n\n".join(merged)
 
 
 def _summarize_tool_output(text: str) -> str:
@@ -602,7 +834,7 @@ def _summarize_tool_output(text: str) -> str:
 def _tool_output_inline_summary(text: str) -> str:
     summarized = _summarize_tool_output(text)
     summarized = summarized.replace("\n", " | ")
-    return _truncate_text(summarized, 220)
+    return _truncate_text(summarized, MAX_HISTORY_LINE_CHARS)
 
 
 def _summarize_free_text(text: str, limit: int) -> str:

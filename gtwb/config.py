@@ -52,9 +52,28 @@ class Config:
 
     # ── 协议转换 ──────────────────────────────────────────────────────────
     desensitize: bool = True  # 默认开：Codex / Claude Code 的长 system prompt 极易撞审核
-    compact_harness: bool = True  # 压缩 harness 提示词（关掉则保留原文，审核风险更高）
-    strip_tool_metadata: bool = True  # 去掉 tool description 里的安全术语
-    retry_on_filter: bool = True  # 命中审核时用紧凑模式重试一次（仅非压缩模式生效）
+    compact_harness: bool = True  # 审核降级时压缩 harness 提示词（见 preserve_harness）
+    strip_tool_metadata: bool = True  # 审核降级时去掉 tool description
+    retry_on_filter: bool = True  # 命中审核时用紧凑模式重试一次
+
+    # 首轮是否忠实透传 harness 提示词与工具描述（只在"无损脱敏"下工作）。
+    #
+    # 实测教训：把 compact_harness 无条件应用到每个请求，会把 Codex 的 2 万字符
+    # 操作手册压成 173 字符、把 9 个工具的描述全部清空。模型因此不知道工具怎么用，
+    # agent 任务质量直接崩掉。而实测 1412 次请求里命中审核 0 次 —— 用"必然的
+    # 能力损失"去防"从未发生的风险"不划算。
+    # 现在的做法：首轮无损（只插零宽空格），只有真的被拦了才降级压缩重试。
+    preserve_harness: bool = True
+
+    # 请求了不可用模型名时的兜底模型（空串 = 保持原样报 400）。
+    # 客户端（cc-switch 等）常把模型名写成 Codex 原生名（gpt-5.6-luna 等），
+    # 这些名字在上游不存在 → 400 → 整条 agent 链路直接失败。
+    model_fallback: str = ""
+    # 显式别名映射，例如 {"gpt-5.6-luna": "deepseek-v4.1-flash"}
+    model_aliases: dict[str, str] = field(default_factory=dict)
+
+    # 诊断抓包目录（非空则把每个 /v1/responses 请求体落盘，用于排查协议问题）
+    capture_dir: str | None = None
 
     # ── 上游 ──────────────────────────────────────────────────────────────
     backend: str = BACKEND_CHAT
@@ -72,6 +91,8 @@ class Config:
     breaker_cooldown_max_s: int = 21600  # 熔断冷却上限
     hard_cooldown_hour: int = 4  # 余额不足 → 冷却到次日该点（等额度恢复）
     max_in_flight: int = 3  # 单账号在途请求上限
+    upstream_retry: int = 2  # 传输层错误/429/5xx 首字节前自动重试次数（学习 new-api）
+    retry_backoff_s: float = 1.5  # 重试退避基数（×attempt 线性退避）
 
     # ── 状态持久化 ────────────────────────────────────────────────────────
     state_file: str = "state.json"
@@ -86,6 +107,19 @@ class Config:
         return asdict(self)
 
 
+def _parse_aliases(raw: str) -> dict[str, str]:
+    """解析 GTWB_MODEL_ALIASES，形如 'gpt-5.6-luna=deepseek-v4.1-flash,a=b'。"""
+    out: dict[str, str] = {}
+    for pair in (raw or "").split(","):
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k and v:
+            out[k] = v
+    return out
+
+
 # 环境变量 → 配置字段。前缀 GTWB_。
 _ENV_MAP: dict[str, tuple[str, type]] = {
     "GTWB_HOST": ("host", str),
@@ -94,7 +128,10 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "GTWB_LOG": ("log_path", str),
     "GTWB_DESENSITIZE": ("desensitize", bool),
     "GTWB_COMPACT": ("compact_harness", bool),
+    "GTWB_PRESERVE_HARNESS": ("preserve_harness", bool),
     "GTWB_RETRY_ON_FILTER": ("retry_on_filter", bool),
+    "GTWB_MODEL_FALLBACK": ("model_fallback", str),
+    "GTWB_CAPTURE_DIR": ("capture_dir", str),
     "GTWB_BACKEND": ("backend", str),
     "GTWB_TIMEOUT": ("timeout_s", float),
     "GTWB_STATE_FILE": ("state_file", str),
@@ -147,6 +184,8 @@ def load_config(
         raw = env.get(env_key)
         if raw:
             setattr(cfg, field_name, _coerce(raw, typ))
+    if env.get("GTWB_MODEL_ALIASES"):
+        cfg.model_aliases = _parse_aliases(env["GTWB_MODEL_ALIASES"])
 
     # 3) 显式覆盖（命令行）
     for k, v in (overrides or {}).items():

@@ -16,29 +16,31 @@ from typing import Any
 
 _LOCK = threading.Lock()
 _LOG_PATH: str | None = None
+_STAT_PATH: str | None = None
 _VERBOSE = False
 
 # 单份日志上限。常驻进程必须自己收敛日志体积，否则长期跑会把磁盘写满。
 _LOG_MAX_BYTES = 8 * 1024 * 1024
+_STAT_MAX_BYTES = 32 * 1024 * 1024
 
 
 def setup(log_path: str | None = None, verbose: bool = False) -> None:
-    global _LOG_PATH, _VERBOSE
+    global _LOG_PATH, _STAT_PATH, _VERBOSE
     _LOG_PATH = log_path
+    # 用量记账 JSONL 与日志同目录，供用量看板聚合
+    _STAT_PATH = os.path.join(os.path.dirname(log_path), "usage-stats.jsonl") if log_path else None
     _VERBOSE = verbose
 
 
-def _rotate_if_needed() -> None:
-    """日志超过上限则轮转一份（保留 .1），只留最近两份。"""
-    if not _LOG_PATH:
-        return
+def _rotate(path: str, limit: int) -> None:
+    """单文件超限则轮转一份（保留 .1），只留最近两份。"""
     try:
-        if os.path.getsize(_LOG_PATH) < _LOG_MAX_BYTES:
+        if os.path.getsize(path) < limit:
             return
-        backup = _LOG_PATH + ".1"
+        backup = path + ".1"
         if os.path.exists(backup):
             os.remove(backup)
-        os.replace(_LOG_PATH, backup)
+        os.replace(path, backup)
     except OSError:
         pass  # 轮转失败绝不影响主链路
 
@@ -49,11 +51,24 @@ def _emit(line: str) -> None:
         sys.stderr.flush()
         if _LOG_PATH:
             try:
-                _rotate_if_needed()
+                _rotate(_LOG_PATH, _LOG_MAX_BYTES)
                 with open(_LOG_PATH, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
             except OSError:
                 pass  # 日志失败绝不影响主链路
+
+
+def _write_stat(record: dict) -> None:
+    """用量记账：每条请求一行 JSONL，失败绝不影响主链路。"""
+    if not _STAT_PATH:
+        return
+    try:
+        with _LOCK:
+            _rotate(_STAT_PATH, _STAT_MAX_BYTES)
+            with open(_STAT_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def log(msg: str, rid: str = "") -> None:
@@ -92,7 +107,10 @@ class RequestStat:
         self.finish: str | None = None
         self.tool_calls: list[str] = []
         self.filtered = False
+        self.escalated = False   # 是否走过"紧凑模式重试"（首轮被上游拒绝）
         self.uid8 = ""
+        self.usage: dict | None = None   # 后端完整 usage（供用量记账）
+        self.elapsed: float | None = None
 
     def first_byte(self) -> None:
         if self.ttfb is None:
@@ -114,7 +132,10 @@ class RequestStat:
                     self.filtered = True
                 continue
             if isinstance(obj, dict) and obj.get("usage"):
-                self.tokens = (obj["usage"] or {}).get("total_tokens") or self.tokens
+                u = obj["usage"]
+                self.tokens = (u or {}).get("total_tokens") or self.tokens
+                if isinstance(u, dict):
+                    self.usage = u  # 完整保留（含 cached/reasoning 明细）
             for ch in (obj.get("choices") or []) if isinstance(obj, dict) else []:
                 if ch.get("finish_reason"):
                     self.finish = ch["finish_reason"]
@@ -127,6 +148,8 @@ class RequestStat:
 
     def done(self) -> None:
         elapsed = time.perf_counter() - self.t0
+        self.elapsed = elapsed
+        self._record()
         tag = " ⚠️内容审核拦截" if self.filtered or self.finish == "content-filter" else ""
         parts = [
             f"◀ {self.mode} {self.model}",
@@ -143,7 +166,34 @@ class RequestStat:
             parts.append(f"tokens={self.tokens}({rate})")
         if self.uid8:
             parts.append(f"uid={self.uid8}")
+        if self.escalated:
+            parts.append("escalated=1")
         log(" | ".join(parts) + tag, self.rid)
+
+    def _record(self) -> None:
+        """把本请求追加进用量 JSONL（扁平字段，看板直接聚合）。"""
+        u = self.usage or {}
+        pt = u.get("prompt_tokens_details") or {}
+        ct = u.get("completion_tokens_details") or {}
+        rec = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": self.mode,
+            "model": self.model,
+            "status": self.status,
+            "elapsed": round(self.elapsed, 3) if self.elapsed is not None else None,
+            "ttfb": round(self.ttfb, 3) if self.ttfb is not None else None,
+            "finish": self.finish,
+            "filtered": self.filtered,
+            "escalated": self.escalated,
+            "uid8": self.uid8,
+            "tools": len(self.tool_calls),
+            "prompt_tokens": u.get("prompt_tokens"),
+            "completion_tokens": u.get("completion_tokens"),
+            "total_tokens": u.get("total_tokens"),
+            "cached_tokens": pt.get("cached_tokens"),
+            "reasoning_tokens": ct.get("reasoning_tokens"),
+        }
+        _write_stat(rec)
 
 
 def _looks_filtered(text: str) -> bool:

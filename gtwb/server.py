@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import time
 from typing import Any, AsyncIterator
 
@@ -38,10 +40,14 @@ PASSTHROUGH_KEYS = {
     "max_completion_tokens", "top_p", "stream", "stream_options", "stop",
     "presence_penalty", "frequency_penalty", "n", "response_format", "seed",
     "user", "reasoning_effort", "verbosity", "reasoning_summary",
+    "parallel_tool_calls", "prompt_cache_key",
 }
 
 _MODEL_CACHE: dict[str, Any] = {"ids": [], "at": 0.0}
 MODEL_TTL_S = 3600
+
+# 抓包失败只提示一次，避免把日志刷爆
+_CAPTURE_WARNED = False
 
 
 class Gateway:
@@ -99,6 +105,35 @@ class Gateway:
                 return acct, ""
             reason = self.health.get(uid).reason()
         return acct, reason
+
+    # ── 模型名解析 ────────────────────────────────────────────────────────
+    async def resolve_model(self, requested: str) -> tuple[str, str]:
+        """把客户端请求的模型名解析成上游真实可用的名字。
+
+        为什么需要：客户端（cc-switch、Codex 桌面端）常常把模型名写成 Codex 原生名
+        （gpt-5.6-luna / gpt-5.6-terra / gpt-6-astra 等），这些名字在上游不存在，
+        直接透传会拿到 HTTP 400 —— 整条 agent 链路当场失败，客户端还以为是自己坏了。
+
+        返回 (实际使用的模型名, 替换说明)。未配置别名/兜底时零开销直接放行。
+        """
+        name = (requested or "").strip()
+        if not name:
+            return requested, ""
+
+        aliases = getattr(self.cfg, "model_aliases", None) or {}
+        if name in aliases:
+            return aliases[name], f"alias {name}→{aliases[name]}"
+
+        fallback = (getattr(self.cfg, "model_fallback", "") or "").strip()
+        if not aliases and not fallback:
+            return requested, ""      # 未启用该能力：不查模型表，零额外开销
+
+        ids = await self.model_ids()
+        if not ids or name == "auto" or name in ids:
+            return requested, ""
+        if fallback:
+            return fallback, f"unavailable {name}→{fallback}"
+        return requested, ""
 
 
 def _is_loopback(request: Request) -> bool:
@@ -202,15 +237,24 @@ def build_app(gw: Gateway) -> FastAPI:
         return body
 
     def _desensitize(body: dict[str, Any], force_compact: bool = False) -> dict[str, Any]:
+        """脱敏两档：
+
+        - 首轮（默认）：**无损**——只插零宽空格，完整保留真实提示词与工具描述。
+          模型必须知道工具怎么用，agent 才可能干成活。
+        - 降级（force_compact，仅命中审核后重试）：把 harness 提示词摘要化、
+          去掉工具描述，用能力换通过率。
+        """
         if not cfg.desensitize:
             return body
+        hard = bool(force_compact)
         return desensitize_body(
             body,
             roles=("system", "developer"),
             desensitize_harness_user=True,
             desensitize_tools=True,
-            compact_harness=(force_compact or cfg.compact_harness),
-            strip_tool_metadata=cfg.strip_tool_metadata,
+            compact_harness=hard and cfg.compact_harness,
+            strip_tool_metadata=hard and cfg.strip_tool_metadata,
+            prune_runtime=hard,
         )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -222,24 +266,57 @@ def build_app(gw: Gateway) -> FastAPI:
         stat.status = stat.status or 0
 
     async def _open(acct: Any, body: dict[str, Any], rid: str):
-        """打开上游流；401 且非会话死亡时强制刷新一次再试。"""
+        """打开上游流；401 且非会话死亡时强制刷新一次再试。
+
+        失败自动重试（学习 new-api）：传输层错误 / 429 / 5xx 在首字节前可安全重试，
+        默认重试 2 次、退避 1.5s×attempt（可配 upstream_retry / retry_backoff_s）。
+        """
         uid = acct.uid or acct.source
-        resp = await _open_raw(acct, body)
-        if resp.status_code == 401:
-            raw = await resp.aread()
-            await resp.aclose()
-            if upstream.classify(401, raw.decode("utf-8", "replace")) is ErrKind.AUTH:
-                obs.log("401 → 强制刷新登录态后重试", rid)
-                try:
-                    acct = await gw.accounts.force_refresh()
-                    resp = await _open_raw(acct, body)
-                except Exception as e:
-                    obs.log(f"强制刷新失败：{e}", rid)
+        max_retry = int(getattr(cfg, "upstream_retry", 2) or 0)
+        backoff = float(getattr(cfg, "retry_backoff_s", 1.5) or 1.5)
+        attempt = 0
+        while True:
+            try:
+                resp = await _open_raw(acct, body)
+            except Exception as e:
+                attempt += 1
+                if attempt <= max_retry:
+                    obs.log(f"⚠ 网络错误 {type(e).__name__}: {obs.truncate(str(e), 120)}"
+                            f" → 重试 {attempt}/{max_retry}", rid)
+                    await asyncio.sleep(backoff * attempt)
+                    continue
+                obs.log(f"✗ 网络错误重试耗尽：{obs.truncate(str(e), 160)}", rid)
+                return acct, None, str(e).encode(), ErrKind.NETWORK
+
+            if resp.status_code == 401:
+                raw = await resp.aread()
+                await resp.aclose()
+                if upstream.classify(401, raw.decode("utf-8", "replace")) is ErrKind.AUTH:
+                    obs.log("401 → 强制刷新登录态后重试", rid)
+                    try:
+                        acct = await gw.accounts.force_refresh()
+                        resp = await _open_raw(acct, body)
+                    except Exception as e:
+                        obs.log(f"强制刷新失败：{e}", rid)
+                        return acct, None, raw, ErrKind.SESSION_DEAD
+                    raw = b""
+                else:
                     return acct, None, raw, ErrKind.SESSION_DEAD
-                raw = b""
-            else:
-                return acct, None, raw, ErrKind.SESSION_DEAD
-        return acct, resp, b"", ErrKind.NONE
+                # 刷新后可能拿到新 resp，继续走 429/5xx 检查
+                if resp.status_code not in (429,) and resp.status_code < 500:
+                    return acct, resp, b"", ErrKind.NONE
+
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raw = await resp.aread()
+                await resp.aclose()
+                attempt += 1
+                if attempt <= max_retry:
+                    obs.log(f"⚠ HTTP {resp.status_code} → 重试 {attempt}/{max_retry}", rid)
+                    await asyncio.sleep(backoff * attempt)
+                    continue
+                return acct, None, raw, upstream.classify(resp.status_code, raw.decode("utf-8", "replace"))
+
+            return acct, resp, b"", ErrKind.NONE
 
     async def _open_raw(acct: Any, body: dict[str, Any]):
         # 直接用 httpx 的 stream 上下文，手动持有 resp（在 _execute 里统一关闭）
@@ -280,10 +357,16 @@ def build_app(gw: Gateway) -> FastAPI:
         wants_stream = bool(payload.get("stream"))
         body = {k: payload[k] for k in PASSTHROUGH_KEYS if k in payload}
         body = _finalize(body)
-        body = _desensitize(body)
 
         rid = obs.new_rid()
-        model = payload.get("model", "auto")
+        model, model_note = await gw.resolve_model(payload.get("model", "auto"))
+        if model_note:
+            obs.log(f"↪ 模型名替换：{model_note}", rid)
+        if model != payload.get("model"):
+            body["model"] = model
+
+        original_body = body
+        body = _desensitize(body)
         stat = obs.RequestStat(model, "CHAT", rid)
         obs.log(
             f"▶ CHAT {model} | stream={wants_stream} | msgs={len(payload['messages'])}"
@@ -296,6 +379,7 @@ def build_app(gw: Gateway) -> FastAPI:
             gw, rid, stat, body, wants_stream,
             stream_render=lambda r, s: _plain_stream(r, s),
             nonstream_render=lambda r, s: _aggregate_chat(r, s),
+            escalate=lambda: _desensitize(original_body, force_compact=True),
         )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -311,8 +395,10 @@ def build_app(gw: Gateway) -> FastAPI:
         gw.check_auth(authorization, x_api_key)
         payload = await _json(request)
 
+        _capture(cfg, "responses", payload)
+
         try:
-            body = responses_request_to_chat(payload)
+            body, bare_to_ns = responses_request_to_chat(payload)
         except Exception as e:
             raise _bad_request(f"request conversion error: {e}")
 
@@ -321,11 +407,15 @@ def build_app(gw: Gateway) -> FastAPI:
         body = _desensitize(body)
 
         rid = obs.new_rid()
-        model = payload.get("model", "auto")
+        model, model_note = await gw.resolve_model(payload.get("model", "auto"))
+        if model_note:
+            obs.log(f"↪ 模型名替换：{model_note}", rid)
+        if model != payload.get("model"):
+            body["model"] = model
         stat = obs.RequestStat(model, "RESPONSES", rid)
         obs.log(
             f"▶ RESPONSES {model} | input_items={len(payload.get('input') or [])}"
-            f" | projection msgs {proj.get('original_messages')}→{proj.get('projected_messages')}"
+            f" | projection[{proj.get('mode')}] msgs {proj.get('original_messages')}→{proj.get('projected_messages')}"
             f" chars {proj.get('original_message_chars')}→{proj.get('projected_message_chars')}"
             f" tools {proj.get('original_tools')}→{proj.get('projected_tools')}",
             rid,
@@ -333,21 +423,23 @@ def build_app(gw: Gateway) -> FastAPI:
         obs.debug(rid, "RESPONSES → CHAT BODY", body)
 
         wants_stream = bool(payload.get("stream", True))
-        # 仅在「非压缩模式」下才需要缓冲整段以支持审核重试；默认压缩模式下直通流式。
-        needs_buffer = cfg.desensitize and not cfg.compact_harness and cfg.retry_on_filter
 
         conv_holder: dict[str, Any] = {}
 
         def _mk_conv() -> ResponsesStreamConverter:
-            c = ResponsesStreamConverter(model=model)
+            c = ResponsesStreamConverter(model=model, bare_to_ns=bare_to_ns)
             conv_holder["c"] = c
             return c
+
+        def _escalate() -> dict[str, Any]:
+            """首轮被上游拒绝时的降级体：紧凑提示词 + 去工具描述。"""
+            return _desensitize(body, force_compact=True)
 
         return await _execute(
             gw, rid, stat, body, wants_stream,
             stream_render=lambda r, s: _responses_stream(r, s, _mk_conv(), rid),
             nonstream_render=lambda r, s: _responses_nonstream(r, s, _mk_conv(), model, rid),
-            buffer_response=needs_buffer,
+            escalate=_escalate,
         )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -370,10 +462,16 @@ def build_app(gw: Gateway) -> FastAPI:
         except Exception as e:
             raise _bad_request(f"request conversion error: {e}")
         body = _finalize(body)
-        body = _desensitize(body)
 
         rid = obs.new_rid()
-        model = payload.get("model", "auto")
+        model, model_note = await gw.resolve_model(payload.get("model", "auto"))
+        if model_note:
+            obs.log(f"↪ 模型名替换：{model_note}", rid)
+        if model != payload.get("model"):
+            body["model"] = model
+
+        original_body = body
+        body = _desensitize(body)
         stat = obs.RequestStat(model, "ANTHROPIC", rid)
         obs.log(f"▶ ANTHROPIC {model} | msgs={len(body.get('messages') or [])}", rid)
         obs.debug(rid, "ANTHROPIC → CHAT BODY", body)
@@ -385,7 +483,7 @@ def build_app(gw: Gateway) -> FastAPI:
             gw, rid, stat, body, wants_stream,
             stream_render=lambda r, s: _anthropic_stream(r, s, AnthropicStreamConverter(model=model), rid),
             nonstream_render=lambda r, s: _anthropic_nonstream(r, s, model, rid),
-            buffer_response=cfg.desensitize and not cfg.compact_harness and cfg.retry_on_filter,
+            escalate=lambda: _desensitize(original_body, force_compact=True),
         )
 
     @app.post("/v1/messages/count_tokens")
@@ -413,6 +511,7 @@ def build_app(gw: Gateway) -> FastAPI:
         stream_render,
         nonstream_render,
         buffer_response: bool = False,
+        escalate=None,
     ):
         acct, reject = await gw.pick()
         if reject:
@@ -435,9 +534,11 @@ def build_app(gw: Gateway) -> FastAPI:
 
             if err_kind is not ErrKind.NONE:
                 gw.health.note_error(uid, err_kind)
-                stat.status = 401
+                status = _status_for_kind(err_kind)
+                stat.status = status
                 stat.done()
-                raise _upstream_error(401, err_raw)
+                obs.log(f"✗ 上游不可用 | {stat.model} | {err_kind.value} → {status}", rid)
+                raise _upstream_error(status, err_raw, err_kind)
 
             assert resp is not None
             if resp.status_code != 200:
@@ -445,15 +546,56 @@ def build_app(gw: Gateway) -> FastAPI:
                 await resp.aclose()
                 text = raw.decode("utf-8", "replace")
                 kind = upstream.classify(resp.status_code, text)
-                gw.health.note_error(uid, kind)
-                stat.status = resp.status_code
-                stat.done()
-                obs.log(
-                    f"✗ HTTP {resp.status_code} | {stat.model} | {kind.value} |"
-                    f" {obs.truncate(text, 180)}",
-                    rid,
+
+                # ── 审核/风控拦截：唯一能在"流开始之前"挽救的机会 ──────────────
+                # 此时还没向客户端发出任何字节，可以换成紧凑模式重开一次。
+                if escalate is not None and (obs.looks_filtered(text) or kind is ErrKind.CLIENT):
+                    obs.log(f"↻ 上游 {resp.status_code}，改用紧凑模式重试一次", rid)
+                    try:
+                        _, resp2, _, _ = await _open(acct, escalate(), rid)
+                    except Exception as e:
+                        resp2 = None
+                        obs.log(f"紧凑重试异常：{obs.truncate(str(e), 120)}", rid)
+                    if resp2 is not None and resp2.status_code == 200:
+                        resp = resp2
+                        stat.escalated = True
+                        obs.log("✓ 紧凑模式重试成功", rid)
+                    else:
+                        if resp2 is not None:
+                            await resp2.aclose()
+                        gw.health.note_error(uid, kind)
+                        stat.status = resp.status_code
+                        stat.done()
+                        obs.log(
+                            f"✗ HTTP {resp.status_code} | {stat.model} | {kind.value} |"
+                            f" {obs.truncate(text, 180)}",
+                            rid,
+                        )
+                        raise _upstream_error(resp.status_code, raw, kind)
+                else:
+                    gw.health.note_error(uid, kind)
+                    stat.status = resp.status_code
+                    stat.done()
+                    obs.log(
+                        f"✗ HTTP {resp.status_code} | {stat.model} | {kind.value} |"
+                        f" {obs.truncate(text, 180)}",
+                        rid,
+                    )
+                    raise _upstream_error(resp.status_code, raw, kind)
+
+                # 走到这里说明紧凑重试成功，落到下面的正常成功路径
+                gw.health.note_success(uid)
+                stat.status = 200
+                if not wants_stream:
+                    out = await nonstream_render(resp, stat)
+                    await resp.aclose()
+                    stat.done()
+                    return JSONResponse(content=out)
+                return StreamingResponse(
+                    _guarded_stream(resp, stat, stream_render, uid, gw, rid),
+                    media_type="text/event-stream",
+                    headers=_sse_headers(),
                 )
-                raise _upstream_error(resp.status_code, raw, kind)
 
             # 非压缩模式：先收全量，命中审核则用紧凑模式重试一次
             if buffer_response:
@@ -462,11 +604,12 @@ def build_app(gw: Gateway) -> FastAPI:
                 text = raw.decode("utf-8", "replace")
                 if obs.looks_filtered(text):
                     obs.log("↻ 命中内容审核，改用紧凑模式重试", rid)
-                    retry_body = _desensitize(body, force_compact=True)
+                    retry_body = escalate() if escalate is not None else _desensitize(body, force_compact=True)
                     acct2, resp2, _, _ = await _open(acct, retry_body, rid)
                     if resp2 is not None and resp2.status_code == 200:
                         raw = await resp2.aread()
                         await resp2.aclose()
+                        stat.escalated = True
                 if wants_stream:
                     gw.health.note_success(uid)
                     return StreamingResponse(
@@ -508,18 +651,38 @@ def build_app(gw: Gateway) -> FastAPI:
                 yield chunk
 
     async def _responses_stream(resp, stat, conv, rid) -> AsyncIterator[bytes]:
-        async for line in resp.aiter_lines():
-            stat.first_byte()
-            events = conv.feed_line(line)
-            if events:
-                yield events.encode("utf-8")
-        tail = conv.finish()
-        if tail:
-            yield tail.encode("utf-8")
+        """Chat SSE → Responses 事件流；并保证一定给出终止事件。
+
+        早期实现直接 `async for` 到流结束就收工：上游被掐断时客户端既收不到
+        response.completed 也收不到 response.failed，只能一直挂着等。
+        """
+        try:
+            async for line in resp.aiter_lines():
+                stat.first_byte()
+                stat.feed_sse(line)  # 上游原始 SSE 里的 usage 也要记账（不影响转发）
+                events = conv.feed_line(line)
+                if events:
+                    yield events.encode("utf-8")
+        except httpx.HTTPError as e:
+            obs.log(f"✗ 上游流中断：{obs.truncate(str(e), 160)}", rid)
+            stat.status = 502
+            tail = conv.finish(error={"code": "upstream_stream_error",
+                                      "message": str(e)[:400],
+                                      "type": "upstream_error"})
+            if tail:
+                yield tail.encode("utf-8")
+            return
+        if conv.saw_terminal_evidence():
+            yield conv.finish().encode("utf-8")
+        else:
+            obs.log("⚠ 上游流未见 finish_reason/[DONE]，判定为截断", rid)
+            stat.status = 502
+            yield conv.finish(incomplete={"reason": "upstream_truncated"}).encode("utf-8")
 
     async def _anthropic_stream(resp, stat, conv, rid) -> AsyncIterator[bytes]:
         async for line in resp.aiter_lines():
             stat.first_byte()
+            stat.feed_sse(line)  # 同上：原始 usage 记账
             events = conv.feed_line(line)
             if events:
                 yield events.encode("utf-8")
@@ -542,7 +705,12 @@ def build_app(gw: Gateway) -> FastAPI:
         text = (await resp.aread()).decode("utf-8", "replace")
         stat.first_byte()
         for line in text.splitlines():
+            stat.feed_sse(line)  # 非流式同样补记账
             conv.feed_line(line)
+        if not conv.saw_terminal_evidence():
+            obs.log("⚠ 上游流未见 finish_reason/[DONE]，判定为截断", rid)
+            stat.status = 502
+            return conv.get_nonstream_response(incomplete={"reason": "upstream_truncated"})
         return conv.get_nonstream_response()
 
     async def _anthropic_nonstream(resp, stat, model, rid) -> dict[str, Any]:
@@ -639,12 +807,13 @@ async def _guarded_stream(resp, stat, render, uid, gw, rid) -> AsyncIterator[byt
     except httpx.HTTPError as e:
         gw.health.note_error(uid, ErrKind.NETWORK)
         obs.log(f"✗ 流中断：{e}", rid)
-        stat.status = 502
+        stat.status = stat.status or 502
         stat.done()
         raise
     finally:
         await resp.aclose()
-    stat.status = 200
+    # 渲染器可能已经判定失败/截断并写了状态，不要覆盖成 200
+    stat.status = stat.status or 200
     stat.done()
 
 
@@ -727,7 +896,14 @@ def _safe_json(s: Any) -> Any:
         return {}
 
 
+# 请求体大小上限（学习 new-api MAX_REQUEST_BODY_MB，防超大 base64 载荷撑爆内存）
+MAX_BODY_BYTES = 100 * 1024 * 1024  # 100MB，Codex 带图请求正常远低于此
+
+
 async def _json(request: Request) -> dict[str, Any]:
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+        raise _bad_request(f"request body too large ({int(cl)} bytes, limit {MAX_BODY_BYTES})")
     try:
         payload = await request.json()
     except Exception as e:
@@ -735,6 +911,32 @@ async def _json(request: Request) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise _bad_request("request body must be a JSON object")
     return payload
+
+
+def _capture(cfg: Config, kind: str, payload: dict[str, Any]) -> None:
+    """可选诊断抓包：把客户端原始请求体落盘（默认关闭，失败绝不影响主链路）。
+
+    排查"客户端到底发了什么"最快的手段。设 `capture_dir` 或 GTWB_CAPTURE_DIR 即生效。
+
+    注意：抓包失败不能拖垮主链路，但**也不能静默**——早前这里 `except: pass`
+    掩盖了 `NameError: os` 的缺失，导致抓包长期"开着却没文件"。首次失败记一条
+    告警，之后不再重复刷屏。
+    """
+    try:
+        d = getattr(cfg, "capture_dir", None)
+        if not d:
+            return
+        os.makedirs(d, exist_ok=True)
+        max_bytes = 8 * 1024 * 1024
+        name = f"{time.strftime('%Y%m%d-%H%M%S')}-{kind}-{obs.new_rid()}.json"
+        text = json.dumps(payload, ensure_ascii=False)
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            f.write(text[:max_bytes])
+    except Exception as e:  # noqa: BLE001 — 抓包是旁路，绝不能影响主链路
+        global _CAPTURE_WARNED
+        if not _CAPTURE_WARNED:
+            _CAPTURE_WARNED = True
+            obs.log(f"⚠ 抓包失败（已忽略，不影响请求）：{type(e).__name__}: {e}")
 
 
 def _bad_request(msg: str) -> HTTPException:
@@ -754,6 +956,25 @@ def _upstream_error(status: int, raw: bytes, kind: Any = None) -> HTTPException:
     if kind is not None and not detail:
         detail = {"error": {"message": f"upstream error ({kind.value})", "type": "upstream_error"}}
     return HTTPException(status_code=status or 502, detail=detail)
+
+
+# 错误类型 → 返回给客户端的 HTTP 状态。
+# 早期实现把所有上游异常一律返回 401，客户端（Codex/Claude Code）会把网络抖动
+# 误解为"鉴权失效"从而重新登录或直接放弃，掩盖真实原因。
+_STATUS_BY_KIND: dict[ErrKind, int] = {
+    ErrKind.AUTH: 401,
+    ErrKind.SESSION_DEAD: 401,
+    ErrKind.HARD_CREDIT: 402,
+    ErrKind.SOFT_RATE: 429,
+    ErrKind.NOT_FOUND: 404,
+    ErrKind.SERVER: 502,
+    ErrKind.NETWORK: 502,
+    ErrKind.CLIENT: 400,
+}
+
+
+def _status_for_kind(kind: ErrKind) -> int:
+    return _STATUS_BY_KIND.get(kind, 502)
 
 
 def _sse_headers() -> dict[str, str]:

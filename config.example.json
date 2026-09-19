@@ -5,9 +5,14 @@
   "log_path": "gtwb.log",
 
   "desensitize": true,
+  "preserve_harness": true,
   "compact_harness": true,
   "strip_tool_metadata": true,
   "retry_on_filter": true,
+
+  "model_fallback": "",
+  "model_aliases": {},
+  "capture_dir": null,
 
   "timeout_s": 300,
   "connect_timeout_s": 30,

@@ -37,7 +37,14 @@ name = "{name}"
 base_url = "{base_url}"
 wire_api = "responses"
 requires_openai_auth = true
+experimental_bearer_token = "{key}"
 """
+
+# 说明：`experimental_bearer_token` 是必须的兜底鉴权。
+# 只写 `requires_openai_auth = true` 时，Codex 会去 ~/.codex/auth.json 取 key；
+# 一旦那个文件缺失/过期（换机、CC Switch 没写、手删过），请求就会 401 且报错
+# 指向"登录"，很难联想到是接入包的问题。把 token 直接写进 provider 段落，
+# 鉴权就不再依赖外部文件——2026-09-19 实测：无 auth.json 时仅靠该字段可完整跑通 agent。
 
 
 def load_config() -> dict:
@@ -49,7 +56,7 @@ def load_config() -> dict:
 
 def build_url(host: str, port: int, key: str, model: str, name: str) -> str:
     base_url = f"http://{host}:{port}/v1"
-    toml = TOML_TEMPLATE.format(model=model, name=name, base_url=base_url)
+    toml = TOML_TEMPLATE.format(model=model, name=name, base_url=base_url, key=key)
     params = {
         "resource": "provider",
         "app": "codex",
