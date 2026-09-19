@@ -12,10 +12,12 @@ config.json
 *.info
 auths/
 
-# 接入包里的 deeplink.txt / key.txt 是明文密钥
+# 接入包里的 deeplink.txt / key.txt 是明文密钥（含打好的压缩包与归档目录）
 deploy/home-client-kit/
 deploy/home-client-kit-mac/
 deploy/home-client-kit-mac.rar
+deploy/*.zip
+deploy/_obsolete/
 
 # setup.ps1 每次改写 config.json 前留的备份（含明文密钥）
 config.json.bak.*
