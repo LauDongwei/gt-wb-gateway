@@ -3,26 +3,21 @@
   "port": 8787,
   "api_key": "",
   "log_path": "gtwb.log",
-
   "desensitize": true,
   "preserve_harness": true,
   "compact_harness": true,
   "strip_tool_metadata": true,
   "retry_on_filter": true,
-
   "model_fallback": "",
   "model_aliases": {},
   "capture_dir": null,
-
   "client_identity": true,
   "client_name": "WorkBuddy",
   "client_version": "",
   "cli_version": "",
   "user_agent": "",
-
   "timeout_s": 300,
   "connect_timeout_s": 30,
-
   "soft_cooldown_s": 60,
   "soft_cooldown_max_s": 7200,
   "notfound_cooldown_s": 60,
@@ -31,11 +26,15 @@
   "breaker_cooldown_max_s": 21600,
   "hard_cooldown_hour": 4,
   "max_in_flight": 3,
-
   "state_file": "state.json",
-
   "auth_file": null,
   "auth_dir": null,
   "allow_account_rotation": false,
-  "refresh_skew_s": 300
+  "refresh_skew_s": 300,
+  "web_search": true,
+  "web_search_max_rounds": 3,
+  "web_search_engines": [],
+  "web_search_proxy": "",
+  "web_search_api_key": "",
+  "web_search_brave_key": ""
 }

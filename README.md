@@ -69,7 +69,7 @@ curl http://127.0.0.1:8787/v1/models   # 模型清单
 curl http://127.0.0.1:8787/status      # 冷却/熔断状态
 ```
 
-跑自测套件（135 项离线断言，覆盖状态机、登录态解析与协议硬化）：
+跑自测套件（138 项离线断言，覆盖状态机、登录态解析与协议硬化）：
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -247,6 +247,27 @@ config.json / 环境变量里的几个实用开关：
 | `preserve_harness` | `GTWB_PRESERVE_HARNESS` | 保留 harness 提示词（默认开，关掉会显著降低 agent 可用性） |
 | `client_identity` | `GTWB_CLIENT_IDENTITY` | 按官方客户端身份上报 UA 与 `X-IDE-*`（默认开，见下） |
 | `client_version` | `GTWB_CLIENT_VERSION` | 上报的客户端版本，留空则**自动探测**本机安装版本 |
+| `web_search` | `GTWB_WEB_SEARCH` | **网关侧联网搜索**：客户端发托管 `web_search` 工具时由网关代跑检索并回灌结果（默认开） |
+| `web_search_max_rounds` | `GTWB_WEB_SEARCH_MAX_ROUNDS` | 单次对话内最多代跑几轮搜索（默认 3，超出后禁用搜索逼模型作答） |
+| `web_search_engines` | `GTWB_WEB_SEARCH_ENGINES` | 引擎白名单，留空用内置默认（gnews → cn_bing → so360 → wiki） |
+| `web_search_api_key` | `GTWB_WEB_SEARCH_API_KEY` | 腾讯云联网搜索（WSA）key，配置后优先使用、质量最佳 |
+| `web_search_brave_key` | `GTWB_WEB_SEARCH_BRAVE_KEY` | Brave Search API key（备选官方源） |
+
+### 网关侧联网搜索
+
+上游没有原生搜索能力（`enable_search` / `web_search_options` / 托管型
+`web_search` 全部被静默忽略，实测验证）。客户端（如 Codex）发来
+`{"type":"web_search"}` 时，网关把它降级成普通 function 工具下发给模型；
+模型真正调用时，**网关自己并发检索多引擎**（Google News RSS、cn.bing、
+360、Wikipedia，配了 key 则优先官方源），把结果作为 tool 消息回灌并重开
+上游继续本轮对话。客户端只看到最终答案，中间搜索轮不外发。
+
+- 多轮累积：搜索结果逐轮保留在对话里，模型不会"忘记"搜过什么
+- 重复查询去重：同一 query 直接复用结果并提示模型换关键词
+- 混合轮次安全：模型同一轮里既调搜索又调客户端工具时，已外发的调用会以
+  占位结果补进续跑对话，避免客户端收到重复的 function_call
+- 轮次上限：达到 `web_search_max_rounds` 后跑一轮"收尾轮"（禁用搜索），
+  强制模型基于已有结果作答，而不是把"我再查证一下"当终稿
 
 ### 客户端身份上报
 
@@ -332,7 +353,7 @@ python -m gtwb --diag --lines 40      # 多看几条异常
 | `/v1/chat/completions` 非流式 + 工具调用 | ✅ 200，`finish=tool_calls`，参数正确回传 |
 | `/v1/responses` 非流式 + 流式 | ✅ Codex 事件序列完整（created → in_progress → delta → done） |
 | `/v1/messages` 非流式 + 流式 | ✅ `content_block_start` / `text_delta` / `stop` 事件齐全 |
-| 自测套件 | ✅ 135 项离线断言全绿 |
+| 自测套件 | ✅ 138 项离线断言全绿 |
 | 局域网 / ZeroTier 真实调用 | ✅ 远程打真实模型返回正常，对外 `/health` 自动脱敏 |
 | 计划任务自启 + 双层自愈 | ✅ 进程级自愈 **14.8s**；整树崩溃后看门狗恢复 **5.3s** |
 | 启动器幂等守卫 | ✅ 服务健康时重复启动 **0.2s** 退出，不抢端口不热循环 |
@@ -413,7 +434,7 @@ gt-wb-gateway/
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch 三种接入方式 + 协议判定说明
 │   └── 双机共享-家里电脑.md    ZeroTier 双机方案 / 防火墙 / 稳定性清单 / 风控红线
-├── tests/                自测套件（135 项离线断言）
+├── tests/                自测套件（138 项离线断言）
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

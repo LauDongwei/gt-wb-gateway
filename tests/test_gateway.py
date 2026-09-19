@@ -242,7 +242,7 @@ def test_protocol_adapters() -> None:
     from gtwb.responses_projection import project_responses_chat_body
     from gtwb.anthropic_adapter import anthropic_request_to_chat
 
-    chat, _bare_to_ns = responses_request_to_chat(
+    chat, _name_route, _internal = responses_request_to_chat(
         {
             "model": "glm-5.3",
             "instructions": "你是助手",
@@ -347,7 +347,7 @@ def test_hardening():
               for m in RP.project_responses_chat_body({"messages": big_msgs, "tools": []})[0]["messages"]))
 
     print("\n[请求字段透传]")
-    chat, _ = RA.responses_request_to_chat({
+    chat, _, _ = RA.responses_request_to_chat({
         "model": "m", "instructions": "i",
         "input": [{"role": "user", "content": "hi"}],
         "reasoning": {"effort": "high", "summary": "auto"},
@@ -434,6 +434,21 @@ def test_hardening():
           [it["type"] for it in obj["output"]] == ["function_call", "message"],
           str([it["type"] for it in obj["output"]]))
     check("output 非空", bool(indexes))
+
+    print("\n[内部工具拦截]")
+    conv3 = RA.ResponsesStreamConverter(
+        model="m", internal_tools={"web_search"})
+    conv3.feed_line('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"web_search","arguments":"{\\"query\\":\\"codex\\"}"}}]}}]}')
+    conv3.feed_line('data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"exec_command","arguments":"{\\"cmd\\":\\"ls\\"}"}}]}}]}')
+    conv3.note_done()
+    icalls = conv3.internal_calls()
+    ccalls = conv3.client_calls()
+    check("internal_calls 只收内部工具",
+          [t["name"] for t in icalls] == ["web_search"], str(icalls))
+    check("client_calls 与 internal_calls 互补",
+          [t["name"] for t in ccalls] == ["exec_command"], str(ccalls))
+    check("拦截的调用带完整参数",
+          icalls and icalls[0]["args"] == '{"query":"codex"}', str(icalls))
 
     print("\n[错误码归正]")
     check("NETWORK → 502", SV._status_for_kind(SV.ErrKind.NETWORK) == 502)

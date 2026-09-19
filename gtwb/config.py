@@ -159,6 +159,26 @@ class Config:
     # 显式指定则覆盖上面两项拼出的 UA（一般留空即可）。
     user_agent: str = ""
 
+    # ── 网关侧联网搜索 ────────────────────────────────────────────────────
+    # 上游没有任何原生搜索能力（实测 enable_search / web_search_options /
+    # 托管型 web_search 全被静默忽略）。Codex 的 {"type":"web_search"} 托管工具
+    # 因此降级成普通 function，由网关自己检索后把结果回灌给模型。
+    # 关掉本项则退回旧行为：丢弃 web_search 工具，客户端仍可通过 exec_command
+    # 自己 curl，但拿不到原生搜索体验。
+    web_search: bool = True
+    # 引擎顺序（不填 = 内置默认：gnews → cn_bing → so360 → wiki）。
+    # 配了官方 key 的 wsa/brave/serper/tavily 会自动优先并挤掉国内泛搜兜底。
+    web_search_engines: list[str] = field(default_factory=list)
+    # 搜索请求走的代理。本机 Clash 默认 7897；留空则直连（TUN 模式同样被接管）。
+    web_search_proxy: str = ""
+    web_search_timeout_s: float = 15.0
+    # 一次请求里模型最多触发几轮「搜索→回灌」，防止模型陷入搜索死循环。
+    web_search_max_rounds: int = 3
+    web_search_api_key: str = ""  # 腾讯云联网搜索（WSA，国内合规，推荐）
+    web_search_brave_key: str = ""
+    web_search_serper_key: str = ""
+    web_search_tavily_key: str = ""
+
     # ── 上游 ──────────────────────────────────────────────────────────────
     backend: str = BACKEND_CHAT
     web_origin: str = WEB_ORIGIN
@@ -249,6 +269,14 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "GTWB_CLIENT_VERSION": ("client_version", str),
     "GTWB_CLI_VERSION": ("cli_version", str),
     "GTWB_USER_AGENT": ("user_agent", str),
+    "GTWB_WEB_SEARCH": ("web_search", bool),
+    "GTWB_WEB_SEARCH_PROXY": ("web_search_proxy", str),
+    "GTWB_WEB_SEARCH_TIMEOUT": ("web_search_timeout_s", float),
+    "GTWB_WEB_SEARCH_MAX_ROUNDS": ("web_search_max_rounds", int),
+    "GTWB_WEB_SEARCH_API_KEY": ("web_search_api_key", str),
+    "GTWB_WEB_SEARCH_BRAVE_KEY": ("web_search_brave_key", str),
+    "GTWB_WEB_SEARCH_SERPER_KEY": ("web_search_serper_key", str),
+    "GTWB_WEB_SEARCH_TAVILY_KEY": ("web_search_tavily_key", str),
     "GTWB_STATE_FILE": ("state_file", str),
     "GTWB_AUTH_FILE": ("auth_file", str),
     "GTWB_AUTH_DIR": ("auth_dir", str),
@@ -301,6 +329,10 @@ def load_config(
             setattr(cfg, field_name, _coerce(raw, typ))
     if env.get("GTWB_MODEL_ALIASES"):
         cfg.model_aliases = _parse_aliases(env["GTWB_MODEL_ALIASES"])
+    if env.get("GTWB_WEB_SEARCH_ENGINES"):
+        cfg.web_search_engines = [
+            s.strip() for s in env["GTWB_WEB_SEARCH_ENGINES"].split(",") if s.strip()
+        ]
 
     # 3) 显式覆盖（命令行）
     for k, v in (overrides or {}).items():

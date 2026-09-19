@@ -14,7 +14,10 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import Counter
 from typing import Any
+
+from . import websearch
 
 # ---------------------------------------------------------------------------
 # ID 生成
@@ -27,7 +30,8 @@ def _rand_id(prefix: str = "resp_") -> str:
 # 请求转换：Responses → Chat
 # ---------------------------------------------------------------------------
 
-def responses_request_to_chat(body: dict) -> tuple[dict, dict[str, str]]:
+def responses_request_to_chat(body: dict, enable_web_search: bool = True
+                              ) -> tuple[dict, dict[str, tuple[str, str]], set[str]]:
     """将 Responses API 请求体转换为 Chat Completions 请求体。
 
     关键映射：
@@ -36,10 +40,13 @@ def responses_request_to_chat(body: dict) -> tuple[dict, dict[str, str]]:
       max_output_tokens → max_tokens
       tools 格式微调（Responses 用 name，Chat 用 function.name）
       namespace 工具容器 → 提升为顶层 function，返回 bare→namespace 映射
+      托管型 web_search → 降级为普通 function，由网关自己执行检索
 
-    返回 (chat_body, bare_to_ns)。
+    返回 (chat_body, bare_to_ns, internal_tools)。
+    internal_tools 是「由网关代跑、不转发给客户端」的工具名集合。
     """
-    bare_to_ns: dict[str, str] = {}
+    name_route: dict[str, tuple[str, str]] = {}
+    internal_tools: set[str] = set()
     messages: list[dict] = []
 
     # instructions → system message
@@ -64,7 +71,9 @@ def responses_request_to_chat(body: dict) -> tuple[dict, dict[str, str]]:
     # tools — Responses 和 Chat 的 function tool 格式略有不同
     tools = body.get("tools")
     if tools:
-        chat_tools, bare_to_ns = _convert_tools_for_chat(tools)
+        chat_tools, name_route, internal_tools = _convert_tools_for_chat(
+            tools, enable_web_search=enable_web_search
+        )
         if chat_tools:
             chat["tools"] = chat_tools
     if "tool_choice" in body:
@@ -95,7 +104,7 @@ def responses_request_to_chat(body: dict) -> tuple[dict, dict[str, str]]:
     elif "max_tokens" in body:
         chat["max_tokens"] = body["max_tokens"]
 
-    return chat, bare_to_ns
+    return chat, name_route, internal_tools
 
 
 def _convert_input_items(items: list) -> list[dict]:
@@ -443,7 +452,8 @@ def _extract_output_text(content_parts: list) -> str:
     return "".join(texts)
 
 
-def _convert_tools_for_chat(tools: list) -> tuple[list, dict[str, str]]:
+def _convert_tools_for_chat(tools: list, enable_web_search: bool = True
+                            ) -> tuple[list, dict[str, tuple[str, str]], set[str]]:
     """将 Responses 格式的 tools 转为 Chat 格式。
 
     Responses:  {"type": "function", "name": "shell", "description": ..., "parameters": ...}
@@ -452,16 +462,46 @@ def _convert_tools_for_chat(tools: list) -> tuple[list, dict[str, str]]:
     Codex 0.117+ 会把 MCP 工具打包成 namespace 容器：
       {"type": "namespace", "name": "mcp__cua_repl", "description": ...,
        "tools": [{"type": "function", "name": "js", ...}, ...]}
-    Chat 协议不认识 namespace，这里把子工具"提升"为顶层 function 工具（裸名），
-    并返回 bare→namespace 映射；模型回传调用时由转换器把 namespace 字段还原，
-    Codex 客户端据此路由到对应 MCP 服务器。
-    其他托管型工具（web_search 等）需在 OpenAI 服务端执行，Chat 后端无法承接，丢弃。
+    Chat 协议不认识 namespace，这里把子工具"提升"为顶层 function 工具，
+    并返回 上游名→(namespace, 原始裸名) 的路由表；模型回传调用时由转换器把
+    name 还原、namespace 字段补回，Codex 客户端据此路由到对应 MCP 服务器。
+
+    **同名工具必须改名而不是丢弃**：Codex 实测会同时下发
+    `mcp__cua_repl.js` 与 `mcp__node_repl.js`。早期实现按「先到先得」丢弃后者，
+    模型仍会调用 `js`，结果被路由到 **错误** 的 MCP 服务器（比缺工具更危险）。
+    现在重名的统一加 `<ns>__` 前缀保证唯一，路由时再还原。
+
+    托管型工具 `{"type":"web_search"}` 上游承接不了（实测静默忽略），
+    改为降级成一个普通 function 交给网关自己执行检索（见 `websearch.py`）。
     """
     from . import obs  # 延迟导入避免循环依赖
 
     result: list[dict] = []
-    bare_to_ns: dict[str, str] = {}
-    used_names: set[str] = set()
+    name_route: dict[str, tuple[str, str]] = {}
+    internal_tools: set[str] = set()
+
+    # ── 第一遍：统计裸名出现次数，用来判定哪些必须加前缀 ──────────────────
+    counts: Counter[str] = Counter()
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "namespace":
+            for sub in t.get("tools") or []:
+                if isinstance(sub, dict) and sub.get("type") == "function":
+                    counts[str(sub.get("name") or "")] += 1
+        elif t.get("type") == "function" and t.get("name"):
+            counts[str(t["name"])] += 1
+
+    def _unique(candidate: str, ns_hint: str) -> str:
+        """冲突时加 namespace 前缀，仍冲突则追加序号。"""
+        name = candidate
+        if counts.get(candidate, 0) > 1:
+            name = f"{ns_hint}__{candidate}"
+        i = 2
+        while name in name_route:
+            name = f"{ns_hint}__{candidate}_{i}"
+            i += 1
+        return name
 
     for t in tools:
         if not isinstance(t, dict):
@@ -469,15 +509,17 @@ def _convert_tools_for_chat(tools: list) -> tuple[list, dict[str, str]]:
 
         # ---- namespace 容器：提升内部 function 工具 ----
         if t.get("type") == "namespace":
-            ns_name = t.get("name", "")
+            ns_name = str(t.get("name") or "")
+            ns_hint = ns_name.replace("mcp__", "").replace("__", "_") or "ns"
             for sub in t.get("tools") or []:
                 if not isinstance(sub, dict) or sub.get("type") != "function":
                     continue
-                bare = sub.get("name", "")
-                if not bare or bare in used_names:
-                    obs.log(f"⚠ namespace {ns_name}: skip tool '{bare}' (empty or name collision)")
+                bare = str(sub.get("name") or "")
+                if not bare:
+                    obs.log(f"⚠ namespace {ns_name}: skip tool (empty name)")
                     continue
-                fn: dict[str, Any] = {"name": bare}
+                up = _unique(bare, ns_hint)
+                fn: dict[str, Any] = {"name": up}
                 if sub.get("description"):
                     fn["description"] = sub["description"]
                 if "parameters" in sub:
@@ -485,24 +527,41 @@ def _convert_tools_for_chat(tools: list) -> tuple[list, dict[str, str]]:
                 if "strict" in sub:
                     fn["strict"] = sub["strict"]
                 result.append({"type": "function", "function": fn})
-                bare_to_ns[bare] = ns_name
-                used_names.add(bare)
+                name_route[up] = (ns_name, bare)
+            continue
+
+        # ---- 托管型 web_search → 网关代跑的普通 function ----
+        if t.get("type") == "web_search":
+            if not enable_web_search:
+                obs.log("⚠ 丢弃 web_search（网关侧搜索已关闭）")
+                continue
+            if websearch.TOOL_NAME in name_route:
+                continue
+            result.append(websearch.TOOL_SPEC)
+            internal_tools.add(websearch.TOOL_NAME)
+            name_route[websearch.TOOL_NAME] = ("", websearch.TOOL_NAME)
             continue
 
         if t.get("type") != "function":
-            # 托管型工具（web_search 等）：需 OpenAI 服务端执行，丢弃并记录
+            # 其余托管型工具（file_search / computer_use 等）无人承接，丢弃并记录
             obs.log("⚠ drop non-function tool: type=" + str(t.get("type"))
                     + " name=" + str(t.get("name")))
             continue
 
         # 已经是 Chat 格式（有 "function" key）
         if "function" in t:
+            nm = str((t.get("function") or {}).get("name") or "")
+            if nm in name_route:
+                continue
             result.append(t)
-            used_names.add((t.get("function") or {}).get("name", ""))
+            name_route[nm] = ("", nm)
             continue
 
         # Responses 扁平格式 → Chat 嵌套格式
-        fn = {"name": t.get("name", "")}
+        nm = str(t.get("name") or "")
+        if nm in name_route:
+            continue
+        fn = {"name": nm}
         if "description" in t:
             fn["description"] = t["description"]
         if "parameters" in t:
@@ -510,9 +569,9 @@ def _convert_tools_for_chat(tools: list) -> tuple[list, dict[str, str]]:
         if "strict" in t:
             fn["strict"] = t["strict"]
         result.append({"type": "function", "function": fn})
-        used_names.add(t.get("name", ""))
+        name_route[nm] = ("", nm)
 
-    return result, bare_to_ns
+    return result, name_route, internal_tools
 
 
 # ---------------------------------------------------------------------------
@@ -534,13 +593,22 @@ class ResponsesStreamConverter:
       yield converter.finish().encode()
     """
 
-    def __init__(self, model: str = "unknown", bare_to_ns: dict[str, str] | None = None):
+    def __init__(self, model: str = "unknown",
+                 name_route: dict[str, tuple[str, str]] | None = None,
+                 internal_tools: set[str] | None = None,
+                 bare_to_ns: dict[str, str] | None = None):
         self.resp_id = _rand_id("resp_")
         self.msg_id = _rand_id("msg_")
         self.model = model
         self.created_at = int(time.time())
-        # namespace 还原映射：模型调用的裸名 → 所属 namespace（Codex MCP 路由用）
-        self.bare_to_ns = bare_to_ns or {}
+        # 路由表：上游可见名 → (namespace, 原始裸名)。模型回传调用时据此
+        # 还原 name 并补 namespace 字段，Codex 客户端才能路由到正确的 MCP。
+        self.name_route: dict[str, tuple[str, str]] = dict(name_route or {})
+        if bare_to_ns:  # 兼容旧签名（纯字符串映射）
+            for k, v in bare_to_ns.items():
+                self.name_route.setdefault(k, (v, k))
+        # 由网关代跑、不转发给客户端的工具名（如 web_search）
+        self.internal_tools: set[str] = set(internal_tools or ())
 
         # 状态标记
         self._emitted_created = False
@@ -552,9 +620,43 @@ class ResponsesStreamConverter:
         # 累积内容
         self._content = ""
         self._tool_calls: dict[int, dict] = {}  # index → {id, name, args, fc_id, output_idx, emitted}
+        # 多轮续流时的 index 偏移：内部工具循环会重开上游，各轮 tool_call 的
+        # index 都从 0 开始，不偏移就会互相覆盖。
+        self._idx_base = 0
+        self._round = 0
+        self._round_start = 0  # 本轮文本在 self._content 里的起点
         self._finish_reason: str | None = None
         self._usage: dict | None = None
         self._saw_done = False   # 是否见过上游的 [DONE]
+
+    # ---- 内部工具（网关代跑） ----
+
+    def internal_calls(self) -> list[dict]:
+        """本轮被拦截、需要网关真正执行的工具调用。"""
+        return [tc for _, tc in sorted(self._tool_calls.items()) if tc.get("internal")]
+
+    def client_calls(self) -> list[dict]:
+        """本轮已（或将）外发给客户端的工具调用（与 internal_calls 互补）。"""
+        return [tc for _, tc in sorted(self._tool_calls.items()) if not tc.get("internal")]
+
+    def round_content(self) -> str:
+        """本轮（当前上游请求）模型产出的文本，不含更早的轮次。"""
+        return self._content[self._round_start:]
+
+    def all_content(self) -> str:
+        return self._content
+
+    def begin_next_round(self) -> None:
+        """开一轮新的上游请求（内部工具循环用）。
+
+        保留已向客户端声明的 output item，只把 tool_call 的 index 基线后移，
+        避免新一轮的 index 0/1 覆盖上一轮记录。
+        """
+        self._round += 1
+        self._round_start = len(self._content)
+        if self._tool_calls:
+            self._idx_base += max(self._tool_calls) + 1
+        self._finish_reason = None
 
     # ---- 公开接口 ----
 
@@ -573,14 +675,36 @@ class ResponsesStreamConverter:
             return ""
         return self._process_chunk(chunk)
 
-    def finish(self, error: dict | None = None, incomplete: dict | None = None) -> str:
+    def _accumulate_usage(self, u: dict) -> None:
+        """合并多次上游请求的 usage（内部工具循环每轮都会报一次）。"""
+        if not self._usage:
+            self._usage = dict(u)
+            return
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens",
+                  "input_tokens", "output_tokens"):
+            if isinstance(u.get(k), int):
+                self._usage[k] = (self._usage.get(k) or 0) + u[k]
+        for k in ("prompt_tokens_details", "completion_tokens_details"):
+            if isinstance(u.get(k), dict):
+                tgt = self._usage.setdefault(k, {})
+                for kk, vv in u[k].items():
+                    if isinstance(vv, int):
+                        tgt[kk] = (tgt.get(kk) or 0) + vv
+
+    def finish(self, error: dict | None = None, incomplete: dict | None = None,
+               terminate: bool = True) -> str:
         """流结束后发出终止事件。
 
         - 正常：output_text.done / content_part.done / output_item.done ×N → response.completed
         - 上游中断或出错：统一走 response.failed（带 error），客户端才能立刻给出反馈，
           而不是一直等一个永远不来的 response.completed。
         - 流被上游悄悄截断（没收到 finish_reason）：走 response.incomplete。
+        - `terminate=False`：**中间轮**。网关要接着跑内部工具并重开上游，
+          此时绝不能发 output_item.done / response.completed，否则客户端会认为
+          整轮已结束、后续事件被丢弃。中间轮只返回空串，让客户端继续等。
         """
+        if not terminate and error is None and incomplete is None:
+            return ""
         if error is not None:
             return self._evt("response.failed", {
                 "response": self._response_obj("failed", error=error)
@@ -667,9 +791,9 @@ class ResponsesStreamConverter:
             events.append(self._evt("response.in_progress", {"response": resp}))
             self._emitted_created = True
 
-        # usage
+        # usage（累加：内部工具循环会开多次上游请求，用量应合并记账）
         if chunk.get("usage"):
-            self._usage = chunk["usage"]
+            self._accumulate_usage(chunk["usage"])
 
         for choice in chunk.get("choices", []):
             delta = choice.get("delta", {})
@@ -702,7 +826,7 @@ class ResponsesStreamConverter:
 
             # ---- tool_calls delta ----
             for tc in delta.get("tool_calls", []):
-                idx = tc.get("index", 0)
+                idx = tc.get("index", 0) + self._idx_base
                 if idx not in self._tool_calls:
                     # 计算 output_index：msg 占 0，function_call 从 1 开始（如果有 msg）
                     base = 1 if (self._emitted_msg_item or self._content) else 0
@@ -720,7 +844,31 @@ class ResponsesStreamConverter:
                     slot["id"] = tc["id"]
                 fn = tc.get("function", {})
                 if fn.get("name"):
-                    slot["name"] = fn["name"]
+                    # 兼容三种上游行为：一次给全 / 重复给全 / 分片拼接
+                    if not slot["name"]:
+                        slot["name"] = fn["name"]
+                    elif fn["name"].startswith(slot["name"]):
+                        slot["name"] = fn["name"]
+                    elif not slot["name"].endswith(fn["name"]):
+                        slot["name"] += fn["name"]
+
+                name = slot["name"]
+                # name 还没拼完（仍是某内部工具名的真前缀）→ 先观望，
+                # 别急着向客户端声明一个可能是 web_search 的工具调用
+                if not slot["emitted"] and any(
+                    t != name and t.startswith(name) for t in self.internal_tools
+                ):
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+                    continue
+
+                # 内部工具（如 web_search）：完全不外发，只把参数攒起来
+                # 交给网关自己执行，客户端全程无感
+                if name in self.internal_tools:
+                    slot["internal"] = True
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+                    continue
 
                 if not slot["emitted"]:
                     events.append(self._evt("response.output_item.added", {
@@ -773,10 +921,16 @@ class ResponsesStreamConverter:
             "arguments": tc["args"],
             "status": status,
         }
-        # namespace 还原：Codex 0.117+ 据此把调用路由到对应 MCP 服务器
-        ns = self.bare_to_ns.get(tc["name"])
-        if ns:
-            item["namespace"] = ns
+        # 路由还原：Codex 0.117+ 靠 namespace + name 把调用分派到对应 MCP 服务器。
+        # 重名工具在上游侧被加了 `<ns>__` 前缀，这里必须把 name 改回原始裸名，
+        # 否则客户端会找不到该工具。
+        route = self.name_route.get(tc["name"])
+        if route:
+            ns, orig = route
+            if ns:
+                item["namespace"] = ns
+            if orig and orig != tc["name"]:
+                item["name"] = orig
         return item
 
     def _response_obj(self, status: str, error: dict | None = None,

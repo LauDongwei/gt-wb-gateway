@@ -74,7 +74,7 @@ curl http://127.0.0.1:8787/v1/models   # model list
 curl http://127.0.0.1:8787/status      # cooldown / circuit-breaker state
 ```
 
-Run the test suite (135 offline assertions covering the state machine, session parsing and protocol hardening):
+Run the test suite (138 offline assertions covering the state machine, session parsing and protocol hardening):
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -253,6 +253,38 @@ environment variables. Priority: **defaults → config.json → env vars (`GTWB_
 | `--show-config` | — | Print the effective config and exit |
 | `--diag` | — | Print a diagnostic snapshot and exit: who is connecting, per-client success rate, recent errors (see "Diagnostics") |
 
+Config keys (`GTWB_` env vars also available):
+
+| Key | Env var | Description |
+|---|---|---|
+| `web_search` | `GTWB_WEB_SEARCH` | **Gateway-side web search**: managed `web_search` tools from clients are executed by the gateway itself and the results fed back to the model (default on) |
+| `web_search_max_rounds` | `GTWB_WEB_SEARCH_MAX_ROUNDS` | Max search rounds per turn (default 3; afterwards the tool is disabled to force a final answer) |
+| `web_search_engines` | `GTWB_WEB_SEARCH_ENGINES` | Engine allow-list; empty = built-in defaults (gnews → cn_bing → so360 → wiki) |
+| `web_search_api_key` | `GTWB_WEB_SEARCH_API_KEY` | Tencent Cloud Web Search API key (preferred when set) |
+| `web_search_brave_key` | `GTWB_WEB_SEARCH_BRAVE_KEY` | Brave Search API key (alternative official source) |
+
+### Gateway-side web search
+
+The upstream has **no native search capability** — `enable_search`,
+`web_search_options` and managed `web_search` are all silently ignored
+(verified by probes). When a client (e.g. Codex) sends
+`{"type":"web_search"}`, the gateway demotes it to a regular function tool;
+when the model actually calls it, the gateway fans out to multiple engines
+concurrently (Google News RSS, cn.bing, 360, Wikipedia; official APIs take
+priority when a key is configured), feeds the results back as tool messages
+and re-opens the upstream to continue the same turn. The client only sees
+the final answer.
+
+- Multi-round accumulation: search results stay in the conversation, the
+  model never "forgets" what it already searched
+- Duplicate-query dedup: identical queries reuse cached results with a hint
+  to refine keywords
+- Mixed-turn safety: if the model calls search and client tools in the same
+  turn, already-emitted calls are patched back into the continuation as
+  placeholder results so the client never receives duplicate function calls
+- Round budget: after `web_search_max_rounds` a final round runs with search
+  disabled, forcing an answer instead of an eternal "let me verify again"
+
 ### Client identity reporting
 
 The backend identifies *which client* a call came from by **request headers**, and
@@ -337,7 +369,7 @@ These are measured results against the **real backend**, not paper claims:
 | `/v1/chat/completions` non-streaming + tool calls | ✅ 200, `finish=tool_calls`, args round-trip correctly |
 | `/v1/responses` non-streaming + streaming | ✅ complete Codex event sequence (created → in_progress → delta → done) |
 | `/v1/messages` non-streaming + streaming | ✅ `content_block_start` / `text_delta` / `stop` events all present |
-| Test suites | ✅ 135 offline assertions, all green |
+| Test suites | ✅ 138 offline assertions, all green |
 | LAN / ZeroTier real calls | ✅ real model calls succeed remotely; external `/health` auto-desensitized |
 | Scheduled task + two-layer self-healing | ✅ process-level recovery in **14.8s**; full-tree crash recovered by watchdog in **5.3s** |
 | Idempotent launcher guard | ✅ duplicate start exits in **0.2s** when healthy — no port grabbing, no hot loop |
@@ -427,7 +459,7 @@ gt-wb-gateway/
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch integration methods + protocol notes (Chinese)
 │   └── 双机共享-家里电脑.md    ZeroTier two-machine setup / firewall / stability / risk lines (Chinese)
-├── tests/                test suite (135 offline assertions)
+├── tests/                test suite (138 offline assertions)
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

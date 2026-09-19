@@ -449,9 +449,13 @@ def build_app(gw: Gateway) -> FastAPI:
         _capture(cfg, "responses", payload)
 
         try:
-            body, bare_to_ns = responses_request_to_chat(payload)
+            body, name_route, internal_tools = responses_request_to_chat(
+                payload, enable_web_search=bool(cfg.web_search)
+            )
         except Exception as e:
             raise _bad_request(f"request conversion error: {e}")
+        if internal_tools:
+            obs.log(f"⇄ 网关代跑工具：{sorted(internal_tools)}")
 
         body, proj = project_responses_chat_body(body)
         body = _finalize(body)
@@ -479,7 +483,8 @@ def build_app(gw: Gateway) -> FastAPI:
         conv_holder: dict[str, Any] = {}
 
         def _mk_conv() -> ResponsesStreamConverter:
-            c = ResponsesStreamConverter(model=model, bare_to_ns=bare_to_ns)
+            c = ResponsesStreamConverter(model=model, name_route=name_route,
+                                         internal_tools=internal_tools)
             conv_holder["c"] = c
             return c
 
@@ -487,11 +492,20 @@ def build_app(gw: Gateway) -> FastAPI:
             """首轮被上游拒绝时的降级体：紧凑提示词 + 去工具描述。"""
             return _desensitize(body, force_compact=True)
 
+        # 内部工具（web_search）循环需要账号与原始 body 才能重开上游，
+        # 这两样在 _execute 里才拿得到，用一个 dict 过桥。
+        ctx: dict[str, Any] = {"body": body, "rid": rid,
+                               "internal_tools": internal_tools}
+
+        def _render_stream(r, s):
+            return _responses_stream(r, s, _mk_conv(), rid, ctx)
+
         return await _execute(
             gw, rid, stat, body, wants_stream,
-            stream_render=lambda r, s: _responses_stream(r, s, _mk_conv(), rid),
+            stream_render=_render_stream,
             nonstream_render=lambda r, s: _responses_nonstream(r, s, _mk_conv(), model, rid),
             escalate=_escalate,
+            ctx=ctx,
         )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -568,8 +582,12 @@ def build_app(gw: Gateway) -> FastAPI:
         nonstream_render,
         buffer_response: bool = False,
         escalate=None,
+        ctx: dict[str, Any] | None = None,
     ):
         acct, reject = await gw.pick()
+        if ctx is not None:
+            # 供渲染器在需要时重开上游（网关侧内部工具循环）
+            ctx["acct"] = acct
         if reject:
             obs.log(f"✗ 账号不可用：{reject}", rid)
             raise HTTPException(
@@ -706,28 +724,185 @@ def build_app(gw: Gateway) -> FastAPI:
                 stat.feed_sse(chunk.decode("utf-8", "replace"))
                 yield chunk
 
-    async def _responses_stream(resp, stat, conv, rid) -> AsyncIterator[bytes]:
+    async def _run_internal_search(conv, calls: list[dict], rid: str,
+                                   cache: dict[str, list],
+                                   client_calls: list[dict] | None = None) -> list[dict] | None:
+        """执行模型发起的内部工具（当前只有 web_search），返回要追加的 messages。
+
+        形状按 Chat 协议：assistant(tool_calls=[…]) + 每个调用的 tool 结果。
+        assistant 的 content 用**本轮**文本，不含更早轮次，避免上下文重复膨胀。
+
+        `cache` 按 query 记住已搜过的结果。模型在结果互相矛盾时会反复重搜同一个词
+        （实测第 2、3 轮把前几轮的 query 原样重发），既浪费时间又容易触发上游限流，
+        所以重复 query 直接复用并明确告知模型「这条已经搜过」。
+
+        `client_calls` 是本轮已外发给客户端的调用。混合轮次（模型同时调了
+        web_search 和客户端工具）时必须把它们以占位结果补进续跑对话 —— 否则
+        续跑轮的上游看不到模型调过它们，会把同一个客户端工具再调一遍，
+        客户端就收到重复的 function_call。
+        """
+        from . import websearch as _ws
+
+        tool_calls: list[dict] = []
+        outputs: list[tuple[str, str]] = []
+
+        for tc in client_calls or []:
+            cid = tc.get("id") or f"call_{obs.new_rid()}"
+            tool_calls.append({
+                "id": cid, "type": "function",
+                "function": {"name": tc.get("name") or "",
+                             "arguments": tc.get("args") or "{}"},
+            })
+            outputs.append((cid,
+                            "[This tool call was already delivered to the client; the gateway "
+                            "does not have its output. Do not call it again this turn — its "
+                            "result will arrive with the client's next message.]"))
+
+        for tc in calls:
+            cid = tc.get("id") or f"call_{obs.new_rid()}"
+            args_raw = tc.get("args") or "{}"
+            try:
+                args = json.loads(args_raw) if args_raw.strip() else {}
+            except Exception:
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            name = tc.get("name") or _ws.TOOL_NAME
+            tool_calls.append({
+                "id": cid, "type": "function",
+                "function": {"name": name, "arguments": args_raw},
+            })
+            q = str(args.get("query") or "").strip()
+            try:
+                cnt = int(args.get("count")) if args.get("count") is not None else 8
+            except Exception:
+                cnt = 8
+            if not q:
+                outputs.append((cid, "Error: web_search requires a non-empty 'query'."))
+                continue
+            key = q.lower()
+            if key in cache:
+                got = cache[key]
+                obs.log(f"↺ web_search 复用已有结果 q={q[:52]!r}（模型重复请求）", rid)
+                body_text = ("NOTE: this exact query was already searched earlier in this "
+                             "conversation; the same results are repeated below. Do not "
+                             "search this query again — refine the keywords instead.\n\n")
+            else:
+                got = await _ws.web_search(cfg, q, cnt)
+                cache[key] = got
+                body_text = ""
+            outputs.append((cid, body_text + _ws.format_results(q, got)))
+
+        msgs: list[dict] = [{
+            "role": "assistant",
+            "content": conv.round_content(),
+            "tool_calls": tool_calls,
+        }]
+        for cid, text in outputs:
+            msgs.append({"role": "tool", "tool_call_id": cid, "content": text})
+        return msgs
+
+    async def _responses_stream(resp, stat, conv, rid, ctx=None) -> AsyncIterator[bytes]:
         """Chat SSE → Responses 事件流；并保证一定给出终止事件。
 
         早期实现直接 `async for` 到流结束就收工：上游被掐断时客户端既收不到
         response.completed 也收不到 response.failed，只能一直挂着等。
+
+        另支持「网关侧内部工具」循环：模型调用 web_search（托管工具在上游不可用，
+        已降级成普通 function）时，该 function_call **不转发**给客户端，由网关自己
+        检索并把结果作为 tool 消息回灌，再重开上游继续同一轮对话。客户端只看到
+        最终答案 —— 中间轮不发终止事件，否则客户端会认为整轮已结束。
         """
-        try:
-            async for line in resp.aiter_lines():
-                stat.first_byte()
-                stat.feed_sse(line)  # 上游原始 SSE 里的 usage 也要记账（不影响转发）
-                events = conv.feed_line(line)
-                if events:
-                    yield events.encode("utf-8")
-        except httpx.HTTPError as e:
-            obs.log(f"✗ 上游流中断：{obs.truncate(str(e), 160)}", rid)
-            stat.status = 502
-            tail = conv.finish(error={"code": "upstream_stream_error",
-                                      "message": str(e)[:400],
-                                      "type": "upstream_error"})
-            if tail:
-                yield tail.encode("utf-8")
-            return
+        max_rounds = max(0, int(getattr(cfg, "web_search_max_rounds", 3) or 0))
+        current = resp
+        rounds = 0
+        cache: dict[str, list] = {}
+        finalized = False
+        internal_set = set((ctx or {}).get("internal_tools") or ())
+        body_base = (ctx or {}).get("body") or {}
+        # 累积续跑消息。**必须逐轮累积**：早期实现每轮都从原始 body 重建，
+        # 结果上一轮的搜索结果被丢掉，模型看不到自己搜过什么 —— 于是反复重搜
+        # 同一个 query，收尾轮甚至回一句「我无法联网」。
+        msgs_acc: list[dict] = list(body_base.get("messages") or [])
+
+        while True:
+            try:
+                async for line in current.aiter_lines():
+                    stat.first_byte()
+                    stat.feed_sse(line)  # 上游原始 SSE 里的 usage 也要记账（不影响转发）
+                    events = conv.feed_line(line)
+                    if events:
+                        yield events.encode("utf-8")
+            except httpx.HTTPError as e:
+                obs.log(f"✗ 上游流中断：{obs.truncate(str(e), 160)}", rid)
+                stat.status = 502
+                tail = conv.finish(error={"code": "upstream_stream_error",
+                                          "message": str(e)[:400],
+                                          "type": "upstream_error"})
+                if tail:
+                    yield tail.encode("utf-8")
+                if current is not resp:
+                    await current.aclose()
+                return
+
+            # ── 是否需要代跑内部工具并续流 ─────────────────────────────────
+            calls = conv.internal_calls()
+            if not (calls and ctx is not None and ctx.get("acct") is not None
+                    and conv.saw_terminal_evidence()):
+                break
+
+            if rounds >= max_rounds:
+                # 搜索预算已用尽：必须再跑一轮「收尾轮」并禁用 web_search，
+                # 否则模型会把「我再查证一下」当作终稿交给客户端，答案永远是半截。
+                if finalized:
+                    break
+                finalized = True
+                obs.log(f"⏹ 搜索已达上限 {max_rounds} 轮 → 收尾轮（停用 web_search）", rid)
+                msgs_acc.append({
+                    "role": "user",
+                    "content": ("[The search phase for this turn is over. You already have the "
+                                "search results earlier in this conversation — they are part of "
+                                "your context. Give the user your final answer now, citing those "
+                                "results. Do not claim you cannot access the internet.]"),
+                })
+                next_body = _strip_internal_tools(
+                    {**body_base, "messages": msgs_acc}, internal_set)
+            else:
+                rounds += 1
+                seeds = " ".join(f"q={_brief(c.get('args'))}" for c in calls[:4])
+                obs.log(f"⌕ 网关侧搜索｜第 {rounds} 轮｜{len(calls)} 次调用｜{seeds}", rid)
+                try:
+                    extra = await _run_internal_search(conv, calls, rid, cache,
+                                                       client_calls=conv.client_calls())
+                except Exception as e:
+                    obs.log(f"⚠ 内部工具执行异常：{type(e).__name__}: {str(e)[:140]}", rid)
+                    extra = None
+                if not extra:
+                    break
+                msgs_acc.extend(extra)
+                next_body = {**body_base, "messages": msgs_acc}
+
+            try:
+                nxt = await _open_raw(ctx["acct"], next_body)
+            except Exception as e:
+                obs.log(f"⚠ 续流重开上游失败：{type(e).__name__}: {str(e)[:140]}", rid)
+                break
+            if nxt.status_code != 200:
+                raw = await nxt.aread()
+                await nxt.aclose()
+                obs.log(f"⚠ 续流上游 HTTP {nxt.status_code}："
+                        f"{obs.truncate(raw.decode('utf-8', 'replace'), 150)}", rid)
+                break
+
+            if current is not resp:
+                await current.aclose()
+            current = nxt
+            conv.begin_next_round()
+            stat.first_byte()
+
+        if current is not resp:
+            await current.aclose()
+
         if conv.saw_terminal_evidence():
             yield conv.finish().encode("utf-8")
         else:
@@ -1035,3 +1210,35 @@ def _status_for_kind(kind: ErrKind) -> int:
 
 def _sse_headers() -> dict[str, str]:
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"}
+
+
+def _strip_internal_tools(body: dict, internal: set[str]) -> dict:
+    """复制 body 并移除由网关代跑的工具，用于「收尾轮」逼模型直接作答。"""
+    if not internal:
+        return dict(body)
+    kept: list[Any] = []
+    for t in body.get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        nm = (t.get("function") or {}).get("name") or t.get("name")
+        if nm in internal:
+            continue
+        kept.append(t)
+    out = dict(body)
+    if kept:
+        out["tools"] = kept
+    else:
+        out.pop("tools", None)
+        out.pop("tool_choice", None)
+    return out
+
+
+def _brief(raw: Any, limit: int = 56) -> str:
+    """把 tool_call 的 arguments 压成一行短摘要，仅用于日志（便于归因是哪次搜索）。"""
+    try:
+        obj = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+    except Exception:
+        return f"<{str(raw)[:limit]}>"
+    if isinstance(obj, dict) and obj.get("query"):
+        return '"' + str(obj["query"])[:limit] + '"'
+    return f"<{str(raw)[:limit]}>"
