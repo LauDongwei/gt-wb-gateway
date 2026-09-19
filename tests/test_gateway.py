@@ -365,6 +365,54 @@ def test_hardening():
     check("图片被摘出为 URL 列表", urls == ["data:image/png;base64,AAAA"])
     check("文本部分不含 base64", "AAAA" not in text_out)
 
+    print("\n[并行工具调用配对]")
+    # 回归动机：2026-09-19 Mac Codex Desktop 实测 —— 某轮返回两个 view_image，
+    # 下一轮上游 400 `11148 tool calls and tool results do not match`。
+    # 根因：工具输出里的图片消息被插在两条 tool 结果**之间**，把第二条 tool 与
+    # assistant.tool_calls 隔开。Chat 协议要求 tool_calls 之后**连续**跟上同等
+    # 数量的 tool 消息。修法：图片消息缓存到整组 tool 结果之后再统一发出。
+    _IMG = {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+
+    def _pair_ok(msgs):
+        """校验每条带 tool_calls 的 assistant 后紧跟同数同序的 tool 消息。"""
+        i = 0
+        while i < len(msgs):
+            tcs = msgs[i].get("tool_calls")
+            if msgs[i].get("role") == "assistant" and tcs:
+                follow = msgs[i + 1:i + 1 + len(tcs)]
+                if len(follow) != len(tcs) or any(f.get("role") != "tool" for f in follow):
+                    return False
+                if [f.get("tool_call_id") for f in follow] != [t["id"] for t in tcs]:
+                    return False
+            i += 1
+        return True
+
+    def _parallel(calls):
+        items = [{"type": "message", "role": "user",
+                  "content": [{"type": "input_text", "text": "go"}]}]
+        for cid, name, _out in calls:
+            items.append({"type": "function_call", "call_id": cid, "name": name,
+                          "arguments": "{}"})
+        for cid, _name, out in calls:
+            items.append({"type": "function_call_output", "call_id": cid, "output": out})
+        return RA._convert_input_items(items)
+
+    _m = _parallel([("A", "view_image", [_IMG]), ("B", "view_image", [_IMG])])
+    check("并行 view_image ×2：配对合法", _pair_ok(_m),
+          str([(x["role"], x.get("tool_call_id")) for x in _m]))
+    check("并行 view_image ×2：图片消息在所有 tool 之后",
+          [x["role"] for x in _m] == ["user", "assistant", "tool", "tool", "user"],
+          str([x["role"] for x in _m]))
+    _m2 = _parallel([("A", "exec_command", "ok"), ("B", "exec_command", "ok")])
+    check("并行纯文本 ×2：配对合法且不产生多余消息",
+          _pair_ok(_m2) and [x["role"] for x in _m2] == ["user", "assistant", "tool", "tool"],
+          str([x["role"] for x in _m2]))
+    _m3 = _parallel([("A", "view_image", [_IMG]), ("B", "view_image", "no img")])
+    check("并行混合（仅一个带图）：配对合法",
+          _pair_ok(_m3)
+          and [x["role"] for x in _m3] == ["user", "assistant", "tool", "tool", "user"],
+          str([x["role"] for x in _m3]))
+
     print("\n[流完整性]")
     conv = RA.ResponsesStreamConverter(model="m")
     conv.feed_line('data: {"choices":[{"delta":{"content":"hi"}}]}')

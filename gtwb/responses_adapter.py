@@ -111,6 +111,8 @@ def _convert_input_items(items: list) -> list[dict]:
     # 临时缓存：合并相邻的 assistant message 和 function_call
     pending_assistant_content: str | None = None
     pending_tool_calls: list[dict] = []
+    # 临时缓存：一组连续的 tool 结果 → [(tool 消息, 该输出的图片 URL 列表)]
+    pending_tool_results: list[tuple[dict, list[str]]] = []
 
     def _flush_assistant():
         nonlocal pending_assistant_content, pending_tool_calls
@@ -123,11 +125,44 @@ def _convert_input_items(items: list) -> list[dict]:
             pending_assistant_content = None
             pending_tool_calls.clear()
 
+    def _flush_tool_results():
+        """输出缓存的 tool 结果；图片消息统一挂到整组之后。
+
+        Chat 协议要求 `assistant.tool_calls` 之后**连续**跟上同等数量的 tool
+        消息。工具输出里的图片只能借道 user 消息承载，若在每条 tool 后立即插入，
+        并行调用就会变成 [tool A, user(图), tool B, user(图)] —— B 被 user 隔开，
+        上游直接 400 `11148 tool calls and tool results do not match`。
+
+        实测（2026-09-19，Mac Codex Desktop）：`view_image`×2 触发 11148，
+        而 `exec_command`×2（纯文本输出）正常 —— 差别就在有无图片消息插入。
+        """
+        nonlocal pending_tool_results
+        if not pending_tool_results:
+            return
+        images: list[str] = []
+        for msg, imgs in pending_tool_results:
+            messages.append(msg)
+            images.extend(imgs)
+        if images:
+            messages.append({
+                "role": "user",
+                "content": [{"type": "text",
+                             "text": "[Image output from the previous tool call(s)]"}]
+                           + [{"type": "image_url", "image_url": {"url": u}}
+                              for u in images],
+            })
+        pending_tool_results = []
+
     for item in items:
         if not isinstance(item, dict):
             continue
 
         item_type = item.get("type")
+
+        # 任何非工具结果的项，都意味着上一组工具结果已结束 → 先落盘它们。
+        # `*_call_output` 涵盖 function_call_output 与 local_shell_call_output 等。
+        if not (isinstance(item_type, str) and item_type.endswith("_call_output")):
+            _flush_tool_results()
         role = item.get("role", "")
 
         # 简单消息 {"role": "user", "content": "..."}
@@ -188,19 +223,13 @@ def _convert_input_items(items: list) -> list[dict]:
             _flush_assistant()
             output = item.get("output", "")
             text_out, images = _split_tool_output_images(output)
-            messages.append({
+            pending_tool_results.append(({
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
                 "content": text_out,
-            })
+            }, images))
             # Chat 协议的 tool 消息只能放文本；工具输出里的图片改为紧随其后的
             # 一条 user 消息承载（否则模型"看不见图"，且 base64 会被静默丢弃）。
-            if images:
-                messages.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": "[Image output from the previous tool call]"}]
-                    + [{"type": "image_url", "image_url": {"url": u}} for u in images],
-                })
             continue
 
         # reasoning 项（Codex 开启 reasoning summary 时带回）：
@@ -211,11 +240,11 @@ def _convert_input_items(items: list) -> list[dict]:
         # 其它 *_call / *_call_output（local_shell_call 等未来类型）
         if isinstance(item_type, str) and item_type.endswith("_call_output"):
             _flush_assistant()
-            messages.append({
+            pending_tool_results.append(({
                 "role": "tool",
                 "tool_call_id": item.get("call_id", ""),
                 "content": _normalize_tool_output(item.get("output", "")),
-            })
+            }, []))
             continue
         if isinstance(item_type, str) and item_type.endswith("_call"):
             if pending_assistant_content is None:
@@ -258,6 +287,7 @@ def _convert_input_items(items: list) -> list[dict]:
             content = _extract_content(item.get("content", ""))
             messages.append({"role": role, "content": content})
 
+    _flush_tool_results()
     _flush_assistant()
     return messages
 
