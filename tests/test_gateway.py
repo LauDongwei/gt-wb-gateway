@@ -678,6 +678,26 @@ def test_client_attribution() -> None:
     check("异常判定：审核命中算异常", _is_bad({"status": 200, "filtered": True}) is True)
 
 
+def test_upstream_config() -> None:
+    """上游域名 / Origin 可按部署环境切换（国内账号 vs 国际账号、第二上游实例）。"""
+    from gtwb.config import load_config
+
+    default = Config()
+    check("默认上游域名", default.backend == "https://copilot.tencent.com", default.backend)
+    check("默认 Origin", default.web_origin == "https://www.codebuddy.cn", default.web_origin)
+
+    cfg = load_config(
+        config_path=None,
+        env={
+            "GTWB_BACKEND": "https://intl.backend.example",
+            "GTWB_WEB_ORIGIN": "https://intl.origin.example",
+        },
+    )
+    check("GTWB_BACKEND 覆盖上游域名", cfg.backend == "https://intl.backend.example", cfg.backend)
+    check("GTWB_WEB_ORIGIN 覆盖 Origin/Referer",
+          cfg.web_origin == "https://intl.origin.example", cfg.web_origin)
+
+
 def main() -> int:
     test_classify()
     test_next_hour()
@@ -688,6 +708,7 @@ def main() -> int:
     test_hardening()
     test_client_identity()
     test_client_attribution()
+    test_upstream_config()
 
     print("\n" + "═" * 56)
     print(f"通过 {PASS} 项，失败 {len(FAIL)} 项")

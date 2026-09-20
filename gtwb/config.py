@@ -263,6 +263,7 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "GTWB_MODEL_FALLBACK": ("model_fallback", str),
     "GTWB_CAPTURE_DIR": ("capture_dir", str),
     "GTWB_BACKEND": ("backend", str),
+    "GTWB_WEB_ORIGIN": ("web_origin", str),
     "GTWB_TIMEOUT": ("timeout_s", float),
     "GTWB_CLIENT_IDENTITY": ("client_identity", bool),
     "GTWB_CLIENT_NAME": ("client_name", str),
