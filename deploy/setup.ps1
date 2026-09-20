@@ -170,8 +170,15 @@ if (-not $SkipTask) {
     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable -MultipleInstances IgnoreNew
 
+  # LogonType 必须显式用 S4U（"不管用户是否登录都运行"，免密存储）。
+  # 缺省的 Interactive 会在当前桌面开一个可见的 cmd 窗口：看门狗每 5 分钟
+  # 敲门时闪一次，服务重启时更是直接留一个常驻黑窗在桌面上。
+  # S4U 让任务跑在 session 0，完全无窗口；副作用是注销后服务也继续跑（正是想要的）。
+  # 实测 S4U 下用户 profile 正常加载，auth 文件发现不受影响。
+  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Highest
+
   Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers `
-    -Settings $settings -RunLevel Highest -Force | Out-Null
+    -Settings $settings -Principal $principal -Force | Out-Null
 
   # Register-ScheduledTask 失败时**不是**终止错误，脚本会继续往下走并打印假成功。
   # 必须显式复查，否则会出现"脚本说注册成功、实际任务不存在"。
