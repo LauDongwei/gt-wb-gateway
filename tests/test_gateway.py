@@ -450,6 +450,23 @@ def test_hardening():
     check("拦截的调用带完整参数",
           icalls and icalls[0]["args"] == '{"query":"codex"}', str(icalls))
 
+    print("\n[搜索无进展短路]")
+    # 动机：2026-09-20 实测模型会把上一轮的 query 原样重发，两次会话各烧到
+    # 82.5s / 72.1s。凡是「本轮全部命中缓存」就判无进展、直接进收尾轮。
+    _cache = {"codex cli version": [1, 2]}
+    check("全部命中缓存 → 判为无进展",
+          SV._all_queries_cached(
+              [{"name": "web_search", "args": '{"query":"Codex CLI Version"}'}], _cache) is True)
+    check("含一个新 query → 不算无进展（不打断补充检索）",
+          SV._all_queries_cached(
+              [{"name": "web_search", "args": '{"query":"Codex CLI Version"}'},
+               {"name": "web_search", "args": '{"query":"rust release notes"}'}], _cache) is False)
+    check("空调用列表 → 不算无进展", SV._all_queries_cached([], _cache) is False)
+    check("参数不是合法 JSON → 不算无进展（宁可多搜一轮也不误判）",
+          SV._all_queries_cached([{"name": "web_search", "args": "{bad"}], _cache) is False)
+    check("query 为空 → 不算无进展",
+          SV._all_queries_cached([{"name": "web_search", "args": '{"query":"  "}'}], _cache) is False)
+
     print("\n[错误码归正]")
     check("NETWORK → 502", SV._status_for_kind(SV.ErrKind.NETWORK) == 502)
     check("SERVER → 502", SV._status_for_kind(SV.ErrKind.SERVER) == 502)

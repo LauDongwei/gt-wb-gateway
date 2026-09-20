@@ -69,7 +69,7 @@ curl http://127.0.0.1:8787/v1/models   # 模型清单
 curl http://127.0.0.1:8787/status      # 冷却/熔断状态
 ```
 
-跑自测套件（138 项离线断言，覆盖状态机、登录态解析与协议硬化）：
+跑自测套件（143 项离线断言，覆盖状态机、登录态解析与协议硬化）：
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -353,7 +353,7 @@ python -m gtwb --diag --lines 40      # 多看几条异常
 | `/v1/chat/completions` 非流式 + 工具调用 | ✅ 200，`finish=tool_calls`，参数正确回传 |
 | `/v1/responses` 非流式 + 流式 | ✅ Codex 事件序列完整（created → in_progress → delta → done） |
 | `/v1/messages` 非流式 + 流式 | ✅ `content_block_start` / `text_delta` / `stop` 事件齐全 |
-| 自测套件 | ✅ 138 项离线断言全绿 |
+| 自测套件 | ✅ 143 项离线断言全绿 |
 | 局域网 / ZeroTier 真实调用 | ✅ 远程打真实模型返回正常，对外 `/health` 自动脱敏 |
 | 计划任务自启 + 双层自愈 | ✅ 进程级自愈 **14.8s**；整树崩溃后看门狗恢复 **5.3s** |
 | 启动器幂等守卫 | ✅ 服务健康时重复启动 **0.2s** 退出，不抢端口不热循环 |
@@ -434,7 +434,7 @@ gt-wb-gateway/
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch 三种接入方式 + 协议判定说明
 │   └── 双机共享-家里电脑.md    ZeroTier 双机方案 / 防火墙 / 稳定性清单 / 风控红线
-├── tests/                自测套件（138 项离线断言）
+├── tests/                自测套件（143 项离线断言）
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

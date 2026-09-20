@@ -74,7 +74,7 @@ curl http://127.0.0.1:8787/v1/models   # model list
 curl http://127.0.0.1:8787/status      # cooldown / circuit-breaker state
 ```
 
-Run the test suite (138 offline assertions covering the state machine, session parsing and protocol hardening):
+Run the test suite (143 offline assertions covering the state machine, session parsing and protocol hardening):
 
 ```bash
 .venv/Scripts/python.exe tests/test_gateway.py
@@ -369,7 +369,7 @@ These are measured results against the **real backend**, not paper claims:
 | `/v1/chat/completions` non-streaming + tool calls | ✅ 200, `finish=tool_calls`, args round-trip correctly |
 | `/v1/responses` non-streaming + streaming | ✅ complete Codex event sequence (created → in_progress → delta → done) |
 | `/v1/messages` non-streaming + streaming | ✅ `content_block_start` / `text_delta` / `stop` events all present |
-| Test suites | ✅ 138 offline assertions, all green |
+| Test suites | ✅ 143 offline assertions, all green |
 | LAN / ZeroTier real calls | ✅ real model calls succeed remotely; external `/health` auto-desensitized |
 | Scheduled task + two-layer self-healing | ✅ process-level recovery in **14.8s**; full-tree crash recovered by watchdog in **5.3s** |
 | Idempotent launcher guard | ✅ duplicate start exits in **0.2s** when healthy — no port grabbing, no hot loop |
@@ -459,7 +459,7 @@ gt-wb-gateway/
 ├── docs/
 │   ├── 接入CC-Switch.md       CC Switch integration methods + protocol notes (Chinese)
 │   └── 双机共享-家里电脑.md    ZeroTier two-machine setup / firewall / stability / risk lines (Chinese)
-├── tests/                test suite (138 offline assertions)
+├── tests/                test suite (143 offline assertions)
 ├── config.example.json
 ├── requirements.txt
 └── start.bat

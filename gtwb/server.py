@@ -851,13 +851,20 @@ def build_app(gw: Gateway) -> FastAPI:
                     and conv.saw_terminal_evidence()):
                 break
 
-            if rounds >= max_rounds:
+            if rounds >= max_rounds or (rounds >= 1 and _all_queries_cached(calls, cache)):
                 # 搜索预算已用尽：必须再跑一轮「收尾轮」并禁用 web_search，
                 # 否则模型会把「我再查证一下」当作终稿交给客户端，答案永远是半截。
+                # 另一种情况是「无进展轮」：本轮调用全部命中缓存，模型在原地重发
+                # 上一轮的 query，再跑一轮上游不会有任何新信息，同样直接收尾。
                 if finalized:
                     break
                 finalized = True
-                obs.log(f"⏹ 搜索已达上限 {max_rounds} 轮 → 收尾轮（停用 web_search）", rid)
+                no_progress = rounds < max_rounds
+                if no_progress:
+                    obs.log(f"⏹ 本轮 {len(calls)} 次调用全部是已搜索过的 query"
+                            f"（无进展）→ 直接收尾轮", rid)
+                else:
+                    obs.log(f"⏹ 搜索已达上限 {max_rounds} 轮 → 收尾轮（停用 web_search）", rid)
                 msgs_acc.append({
                     "role": "user",
                     "content": ("[The search phase for this turn is over. You already have the "
@@ -1242,3 +1249,28 @@ def _brief(raw: Any, limit: int = 56) -> str:
     if isinstance(obj, dict) and obj.get("query"):
         return '"' + str(obj["query"])[:limit] + '"'
     return f"<{str(raw)[:limit]}>"
+
+
+def _all_queries_cached(calls: list[dict], cache: dict[str, list]) -> bool:
+    """本轮调用是否**全部**命中已经搜过的 query（即不可能带来任何新信息）。
+
+    动机（2026-09-20 实测）：模型拿不准时会原样重发上一轮的 query ——
+    日志里连续出现 `↺ web_search 复用已有结果（模型重复请求）`，
+    两个会话因此各烧到 82.5s / 72.1s 才被收尾轮强行结束。
+    既然缓存命中不可能产生新结果，这一轮就该直接判为「无进展」交给收尾轮，
+    省掉一次完整的上游往返。只要有一个新 query 就返回 False ——
+    正常的补充检索（换个关键词再查）绝不会被这道判断打断。
+    """
+    if not calls:
+        return False
+    for c in calls:
+        try:
+            obj = json.loads(c.get("args") or "{}")
+        except Exception:
+            return False
+        if not isinstance(obj, dict):
+            return False
+        q = str(obj.get("query") or "").strip().lower()
+        if not q or q not in cache:
+            return False
+    return True
