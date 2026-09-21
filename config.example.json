@@ -10,6 +10,7 @@
   "retry_on_filter": true,
   "model_fallback": "",
   "model_aliases": {},
+  "model_guard": true,
   "capture_dir": null,
   "client_identity": true,
   "client_name": "WorkBuddy",

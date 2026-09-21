@@ -125,15 +125,19 @@ class Gateway:
             return aliases[name], f"alias {name}→{aliases[name]}"
 
         fallback = (getattr(self.cfg, "model_fallback", "") or "").strip()
-        if not aliases and not fallback:
-            return requested, ""      # 未启用该能力：不查模型表，零额外开销
+        guard = bool(getattr(self.cfg, "model_guard", True))
+        if not guard and not fallback:
+            return requested, ""      # 守卫关 + 无兜底：不查模型表，零额外开销
 
         ids = await self.model_ids()
         if not ids or name == "auto" or name in ids:
             return requested, ""
-        if fallback:
-            return fallback, f"unavailable {name}→{fallback}"
-        return requested, ""
+        # 名单外的名字（上游已下线 / 未开通 / 客户端缓存的旧模型）原样发出去
+        # 只会拿到 code 11102 的 400 并把 agent 打断，这里直接拦下换掉。
+        target = fallback or ("auto" if guard else "")
+        if not target or target == name:
+            return requested, ""
+        return target, f"unavailable {name}→{target}"
 
 
 def _is_loopback(request: Request) -> bool:

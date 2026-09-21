@@ -259,6 +259,7 @@ Config keys (`GTWB_` env vars also available):
 |---|---|---|
 | `backend` | `GTWB_BACKEND` | Upstream base URL (default `https://copilot.tencent.com`). **Set this explicitly when running against a different account or deployment** — token *refresh* follows the `domain` recorded in the auth file, while chat/model requests always use this value; when the two disagree you get "refresh works but requests 401/404" |
 | `web_origin` | `GTWB_WEB_ORIGIN` | Value of upstream `Origin` / `Referer` headers (default `https://www.codebuddy.cn`) |
+| `model_guard` | `GTWB_MODEL_GUARD` | Model-name guard (on by default): when the requested model is not in the **account's usable list**, it is swapped for `model_fallback` (or `auto`). Clients often cache an old list; picking from it hits upstream `code 11102` and breaks the agent with a 400 |
 | `web_search` | `GTWB_WEB_SEARCH` | **Gateway-side web search**: managed `web_search` tools from clients are executed by the gateway itself and the results fed back to the model (default on) |
 | `web_search_max_rounds` | `GTWB_WEB_SEARCH_MAX_ROUNDS` | Max search rounds per turn (default 3; afterwards the tool is disabled to force a final answer) |
 | `web_search_engines` | `GTWB_WEB_SEARCH_ENGINES` | Engine allow-list; empty = built-in defaults (gnews → cn_bing → so360 → wiki) |

@@ -235,6 +235,42 @@ def test_model_extraction() -> None:
     flat = {"data": {"models": [{"id": "a"}, {"id": "b"}]}}
     check("兼容 models[].id 形状", _extract_model_ids(flat) == ["a", "b"])
 
+    # ── 2026-09-21 实测结构：上游三层数据只该取第一层 ──────────────────────
+    # 症状：/v1/models 报了 31 个模型，Mac 照着逐个探测，9 个撞上游 code 11102
+    # "model service info not found"（400），agent 被当场打断。
+    live = {
+        "code": 0,
+        "data": {
+            "mergeStrategy": "merge",
+            "agents": [
+                {"name": "cli", "tags": ["cli", "default"],
+                 "models": ["auto", "hy4-preview", "hy3", "deepseek-v4.1-flash", "glm-5.3",
+                            "kimi-k3-1", "minimax-m3", "deepseek-v4-pro"]},
+                {"name": "general-purpose", "tags": ["cli", "general-purpose"], "models": []},
+                # 子 agent 各自挂着内部轻量模型 —— 外部客户端调它会 400
+                {"name": "promptHookEvaluator", "tags": ["cli", "prompt-hook-evaluator"],
+                 "models": ["lite"]},
+                {"name": "Explore", "tags": ["cli", "sub-agent"], "models": ["lite"]},
+                {"name": "Bash", "tags": ["cli", "sub-agent"], "models": ["lite"]},
+            ],
+            # 账号级目录：含已下线 / 未开通条目，实测全为 11102
+            "models": [{"id": "auto"}, {"id": "glm-5.0"}, {"id": "glm-4.6"},
+                       {"id": "glm-4.7"}, {"id": "glm-4.6v"}, {"id": "minimax-m2.5"},
+                       {"id": "kimi-k2-thinking"}, {"id": "hy4-preview-x"},
+                       {"id": "hunyuan-image-v3.0"}, {"id": "default"}],
+        },
+    }
+    live_ids = _extract_model_ids(live)
+    check("主 CLI agent 的模型全保留",
+          all(m in live_ids for m in ("auto", "glm-5.3", "kimi-k3-1", "deepseek-v4-pro")),
+          str(live_ids))
+    check("子 agent 的内部模型 lite 不混入", "lite" not in live_ids, str(live_ids))
+    check("账号目录里的已下线模型不混入",
+          not ({"glm-5.0", "glm-4.6", "glm-4.7", "glm-4.6v", "minimax-m2.5",
+                "kimi-k2-thinking", "hy4-preview-x", "hunyuan-image-v3.0"} & set(live_ids)),
+          str(live_ids))
+    check("清单不再超发（主 agent 8 个 + default）", len(live_ids) == 9, str(live_ids))
+
 
 def test_protocol_adapters() -> None:
     print("\n[协议适配]")
@@ -516,7 +552,8 @@ def test_hardening():
     check("已知模型原样放行", known == ("deepseek-v4.1-flash", ""), str(known))
     check("空模型名不处理", empty == ("", ""), str(empty))
 
-    cfg2 = Config(api_key="")   # 未配置别名/兜底 → 零开销直通
+    # 关掉守卫 → 不查模型表，零开销直通
+    cfg2 = Config(api_key="", model_guard=False)
     gw2 = SV.Gateway.__new__(SV.Gateway)
     gw2.cfg = cfg2
 
@@ -524,7 +561,40 @@ def test_hardening():
         raise AssertionError("不应查模型表")
 
     gw2.model_ids = _boom
-    check("未启用时不查模型表", asyncio.run(gw2.resolve_model("whatever")) == ("whatever", ""))
+    check("守卫关闭时不查模型表", asyncio.run(gw2.resolve_model("whatever")) == ("whatever", ""))
+
+    # ── 守卫默认开：清单外 / 已下线的名字不发给上游，直接换掉 ──────────────
+    # 起因：Mac 的 Codex 缓存了旧清单，照着选 glm-4.6 → 上游 code 11102 → 400 断链。
+    cfg3 = Config(api_key="")
+    gw3 = SV.Gateway.__new__(SV.Gateway)
+    gw3.cfg = cfg3
+
+    async def _ids3():
+        return ["auto", "glm-5.3", "deepseek-v4.1-flash", "default"]
+
+    gw3.model_ids = _ids3
+
+    async def _probe3():
+        return (await gw3.resolve_model("glm-4.6"),      # 上游已下线
+                await gw3.resolve_model("lite"),          # 子 agent 内部模型
+                await gw3.resolve_model("glm-5.3"),
+                await gw3.resolve_model("default"),
+                await gw3.resolve_model("auto"))
+
+    ghost, internal, good, dflt, auto = asyncio.run(_probe3())
+    check("守卫拦下已下线模型 → auto", ghost[0] == "auto" and "unavailable" in ghost[1], str(ghost))
+    check("守卫拦下内部模型 lite", internal[0] == "auto", str(internal))
+    check("清单内模型原样放行", good == ("glm-5.3", ""), str(good))
+    check("default 保留在清单里不被换", dflt == ("default", ""), str(dflt))
+    check("auto 永远放行", auto == ("auto", ""), str(auto))
+
+    # 配了兜底时优先落兜底，而不是 auto
+    cfg4 = Config(api_key="", model_fallback="deepseek-v4.1-flash")
+    gw4 = SV.Gateway.__new__(SV.Gateway)
+    gw4.cfg = cfg4
+    gw4.model_ids = _ids3
+    check("配了兜底则落兜底",
+          asyncio.run(gw4.resolve_model("glm-4.6"))[0] == "deepseek-v4.1-flash")
 
     print("\n[诊断抓包]")
     import tempfile

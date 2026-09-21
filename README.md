@@ -244,6 +244,7 @@ config.json / 环境变量里的几个实用开关：
 | `backend` | `GTWB_BACKEND` | 上游域名（默认 `https://copilot.tencent.com`）。**换账号 / 换部署环境时在此显式指定**：注意刷新令牌会跟随登录态里的 `domain`，而聊天与模型请求固定走这里，两者不一致时表现为"刷得动令牌却请求 401/404" |
 | `web_origin` | `GTWB_WEB_ORIGIN` | 上游请求头的 `Origin` / `Referer` 取值（默认 `https://www.codebuddy.cn`），随上游站点变化 |
 | `model_fallback` | `GTWB_MODEL_FALLBACK` | 客户端发了上游不存在的模型名时落到这个模型，避免 400 崩掉整条 agent |
+| `model_guard` | `GTWB_MODEL_GUARD` | 模型名守卫（默认开）：请求的模型不在**账号可用清单**里就拦下换成 `model_fallback`（未配则 `auto`）。客户端常缓存旧清单，照着选会撞上游 `code 11102` → 400 断链 |
 | `model_aliases` | `GTWB_MODEL_ALIASES` | 模型名映射，如 `{"gpt-5.6-luna": "glm-5.3"}` |
 | `capture_dir` | `GTWB_CAPTURE_DIR` | 诊断抓包目录：把客户端**原始请求体**落盘，排查"Codex 到底发了什么"最快 |
 | `preserve_harness` | `GTWB_PRESERVE_HARNESS` | 保留 harness 提示词（默认开，关掉会显著降低 agent 可用性） |

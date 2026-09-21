@@ -240,7 +240,22 @@ async def _get_models(cfg: C.Config, acct: Account) -> tuple[int, dict[str, Any]
 
 
 def _extract_model_ids(data: dict[str, Any]) -> list[str]:
-    """从后端返回里抽出模型 id（兼容 agents[].models 与扁平列表两种形状）。"""
+    """从后端返回里抽出**对外可用**的模型 id。
+
+    后端返回三层数据，只有一层是给外部客户端用的：
+
+    ① `data.agents[]` 里 tags 含 `cli` **且**含 `default` 的那个 agent —— 账号真实
+       可用的 CLI 模型清单（2026-09-21 逐项实测，全部 200）；
+    ② 其余 agent（Explore / Bash / Plan / promptHookEvaluator …，tags 含
+       `sub-agent`）的 `models` 是**内部子任务用的轻量模型**（如 `lite`），
+       外部客户端调它会 400；
+    ③ `data.models[]` 是账号级模型**目录**，含已下线 / 未开通的条目
+       （实测 `glm-4.6` / `glm-5.0` / `kimi-k2-thinking` 等返回 code 11102
+       "model service info not found"）。
+
+    早期实现把 ①②③ 全并进来，结果 `/v1/models` 里混进 9 个上游不认的名字，
+    客户端（Mac 上的 Codex / CC Switch）照着清单逐个选就会撞 400，把 agent 打断。
+    """
     out: list[str] = []
     seen: set[str] = set()
 
@@ -251,15 +266,30 @@ def _extract_model_ids(data: dict[str, Any]) -> list[str]:
 
     inner = data.get("data") if isinstance(data, dict) else None
     if isinstance(inner, dict):
-        for agent in inner.get("agents") or []:
-            if isinstance(agent, dict) and agent.get("tags") and "cli" in agent["tags"]:
+        agents = [a for a in (inner.get("agents") or []) if isinstance(a, dict)]
+
+        # ① 主 CLI agent：唯一权威来源
+        for agent in agents:
+            tags = agent.get("tags") or []
+            if "cli" in tags and "default" in tags:
                 for m in agent.get("models") or []:
                     push(m)
-        if not out:
-            for agent in inner.get("agents") or []:
-                if isinstance(agent, dict):
-                    for m in agent.get("models") or []:
-                        push(m)
+                if out:
+                    push("default")  # 上游认的默认别名，保留以免客户端被守卫换掉
+                    return out
+
+        # ② 没有主 agent 时：取 cli 里非 sub-agent 的（仍排除内部轻量模型）
+        for agent in agents:
+            tags = agent.get("tags") or []
+            if "cli" in tags and "sub-agent" not in tags:
+                for m in agent.get("models") or []:
+                    push(m)
+        if out:
+            push("default")
+            return out
+
+    # ③ 兜底：账号目录 / 扁平列表（可能含不可用项，但空清单更糟）
+    if isinstance(inner, dict):
         for m in inner.get("models") or []:
             push(m if isinstance(m, str) else (m or {}).get("id"))
     for m in (data.get("models") or []) if isinstance(data, dict) else []:

@@ -129,8 +129,9 @@ def snapshot(cfg: Config, lines: int = 20) -> str:
         w("客户端身份上报 : 关（用量明细「客户端」列会为空）")
     w(f"脱敏 / harness : {'开' if cfg.desensitize else '关'} / "
       f"{'压缩' if cfg.compact_harness else '保留全文'}")
-    w(f"模型兜底       : {cfg.model_fallback or '(未设)'}"
-      f"｜别名 {len(cfg.model_aliases)} 条")
+    w(f"模型兜底       : {cfg.model_fallback or '(未设 → auto)'}"
+      f"｜别名 {len(cfg.model_aliases)} 条"
+      f"｜守卫 {'开' if getattr(cfg, 'model_guard', True) else '关'}")
     w(f"账号轮转       : {'开(不建议)' if cfg.allow_account_rotation else '关'}")
     w("")
 

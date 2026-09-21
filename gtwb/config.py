@@ -145,6 +145,15 @@ class Config:
     # 显式别名映射，例如 {"gpt-5.6-luna": "deepseek-v4.1-flash"}
     model_aliases: dict[str, str] = field(default_factory=dict)
 
+    # 模型名守卫：请求的模型不在账号可用清单里（含上游已下线/未开通的名字）
+    # 就拦下来换掉，而不是原样发给上游拿 400。
+    #
+    # 为什么默认开：客户端常缓存旧清单（Mac 上的 Codex / CC Switch 会记住
+    # 上次拉到的模型列表），用户照着选就会撞上游 code 11102
+    # "model service info not found"，整条 agent 链路当场失败。
+    # 清单外时的落点 = model_fallback，未配则用 "auto"。
+    model_guard: bool = True
+
     # 诊断抓包目录（非空则把每个 /v1/responses 请求体落盘，用于排查协议问题）
     capture_dir: str | None = None
 
@@ -261,6 +270,7 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "GTWB_PRESERVE_HARNESS": ("preserve_harness", bool),
     "GTWB_RETRY_ON_FILTER": ("retry_on_filter", bool),
     "GTWB_MODEL_FALLBACK": ("model_fallback", str),
+    "GTWB_MODEL_GUARD": ("model_guard", bool),
     "GTWB_CAPTURE_DIR": ("capture_dir", str),
     "GTWB_BACKEND": ("backend", str),
     "GTWB_WEB_ORIGIN": ("web_origin", str),
