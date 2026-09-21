@@ -678,6 +678,46 @@ def test_client_attribution() -> None:
     check("异常判定：审核命中算异常", _is_bad({"status": 200, "filtered": True}) is True)
 
 
+def test_usage_accounting() -> None:
+    """用量记账口径：客户端拿到的是跨轮**累加**值，账本必须一致。
+
+    内部工具循环（web_search）会开多次上游请求，每轮各报一次 usage。
+    客户端读到累加值，而 obs 侧若每轮覆盖、只留最后一轮，看板就会系统性少记
+    （2026-09-21 实测同一请求差 4~5 倍，用户据此认为"两边数据不一致"）。
+    """
+    print("\n[用量记账口径]")
+    from gtwb import responses_adapter as RA
+
+    conv = RA.ResponsesStreamConverter(model="m")
+
+    conv.feed_line(
+        'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1000,'
+        '"completion_tokens":20,"total_tokens":1020,'
+        '"prompt_tokens_details":{"cached_tokens":800}}}'
+    )
+    u1 = conv.accumulated_usage()
+    check("第 1 轮：累加值 = 该轮本身",
+          bool(u1) and u1.get("total_tokens") == 1020, str(u1))
+    check("第 1 轮不被重复计入", u1.get("prompt_tokens") == 1000, str(u1))
+
+    conv.begin_next_round()
+    conv.feed_line(
+        'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":1500,'
+        '"completion_tokens":30,"total_tokens":1530,'
+        '"prompt_tokens_details":{"cached_tokens":1200}}}'
+    )
+    u2 = conv.accumulated_usage()
+    check("第 2 轮：prompt 累加而非覆盖",
+          u2.get("prompt_tokens") == 2500, str(u2))
+    check("第 2 轮：total 累加", u2.get("total_tokens") == 2550, str(u2))
+    check("第 2 轮：cached 明细一并累加",
+          (u2.get("prompt_tokens_details") or {}).get("cached_tokens") == 2000, str(u2))
+    check("累加值 ≠ 最后一轮（旧口径确实会少记）",
+          u2.get("total_tokens") != 1530, str(u2))
+    check("accumulated_usage 可被 stat 直接引用",
+          conv.accumulated_usage() is u2)
+
+
 def test_upstream_config() -> None:
     """上游域名 / Origin 可按部署环境切换（国内账号 vs 国际账号、第二上游实例）。"""
     from gtwb.config import load_config
@@ -708,6 +748,7 @@ def main() -> int:
     test_hardening()
     test_client_identity()
     test_client_attribution()
+    test_usage_accounting()
     test_upstream_config()
 
     print("\n" + "═" * 56)

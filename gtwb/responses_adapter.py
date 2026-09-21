@@ -691,6 +691,14 @@ class ResponsesStreamConverter:
                     if isinstance(vv, int):
                         tgt[kk] = (tgt.get(kk) or 0) + vv
 
+    def accumulated_usage(self) -> dict | None:
+        """跨轮累加后的 usage（Chat Completions 形态，与发给客户端的一致）。
+
+        obs 记账要用这个：内部工具循环会开多次上游请求，客户端拿到的是**累加值**，
+        账本若只留最后一轮就会系统性少记（实测同一请求差 4~5 倍）。
+        """
+        return self._usage
+
     def finish(self, error: dict | None = None, incomplete: dict | None = None,
                terminate: bool = True) -> str:
         """流结束后发出终止事件。

@@ -910,6 +910,15 @@ def build_app(gw: Gateway) -> FastAPI:
         if current is not resp:
             await current.aclose()
 
+        # 账本对齐：客户端收到的是跨轮**累加** usage（conv 一直复用），
+        # 而 stat.feed_sse 每轮都写、后写覆盖前写，只留最后一轮。
+        # 不覆盖的话看板就会系统性少记（实测同一请求差 4~5 倍）。
+        # tokens 也要一并对齐，否则日志行与 usage-stats.jsonl 又会对不上。
+        acc = conv.accumulated_usage()
+        if acc:
+            stat.usage = acc
+            stat.tokens = acc.get("total_tokens") or stat.tokens
+
         if conv.saw_terminal_evidence():
             yield conv.finish().encode("utf-8")
         else:
