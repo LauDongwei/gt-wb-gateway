@@ -41,6 +41,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="打印诊断快照（谁在连/各客户端成功率/最近异常）后退出；不启动服务",
     )
     ap.add_argument("--lines", type=int, default=20, help="--diag 显示的异常条数（默认 20）")
+    ap.add_argument(
+        "--enable-account",
+        metavar="UID|all",
+        help="解除账号禁用（会话失效后恢复用；服务在跑时需重启才生效）",
+    )
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     ap.add_argument("--version", action="version", version=f"gt-wb-gateway {__version__}")
     return ap
@@ -140,6 +145,28 @@ def main(argv: list[str] | None = None) -> int:
         from .diag import snapshot
 
         print(snapshot(cfg, lines=max(1, args.lines)))
+        return 0
+
+    if args.enable_account:
+        from .resilience import HealthRegistry
+
+        reg = HealthRegistry(cfg)
+        snap = reg.snapshot()
+        if not snap:
+            print("state 文件里没有任何账号记录，无需解除。", file=sys.stderr)
+            return 1
+        want = list(snap) if args.enable_account == "all" else [args.enable_account]
+        missing = [u for u in want if u not in snap]
+        if missing:
+            print(f"未找到账号：{', '.join(missing)}", file=sys.stderr)
+            print("已知账号：" + ", ".join(snap), file=sys.stderr)
+            return 2
+        for uid in want:
+            was = snap[uid]["state"]
+            reg.enable(uid)
+            print(f"  {uid}  {was} → ok")
+        print("\n已写回 state 文件。服务在跑的话，重启后生效")
+        print("（Windows: Stop-Process + Start-ScheduledTask gt-wb-gateway）。")
         return 0
 
     gw = Gateway(cfg)

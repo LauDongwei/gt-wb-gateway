@@ -214,6 +214,75 @@ def test_auth_parse() -> None:
             check("无 accessToken 应报错", True)
 
 
+def test_wb_encrypted_login() -> None:
+    """WorkBuddy 新版把登录态字段加密成 $wbEncrypted（AES-256-GCM）。
+
+    网关必须还原出明文 token，否则请求头会收到一个 dict，
+    上游直接 401（实测报错：Header value must be str or bytes, not <class 'dict'>）。
+    """
+    print("\n[WorkBuddy 加密登录态]")
+    try:
+        from gtwb import wbtoken  # noqa: PLC0415
+    except ImportError as exc:
+        check("wbtoken 模块存在", False, str(exc))
+        return
+
+    check("明文 token 原样返回", wbtoken.unwrap("plain-token") == "plain-token")
+    check("普通 dict 原样返回", wbtoken.unwrap({"a": 1}) == {"a": 1})
+    check("空字符串原样返回", wbtoken.unwrap("") == "")
+
+    if not wbtoken.available():
+        check("解密器可用（wb-encrypted-token-decrypt skill 在位）", False, "未找到解密器")
+        return
+    check("解密器可用（wb-encrypted-token-decrypt skill 在位）", True)
+
+    import base64
+    import hashlib
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    mod = wbtoken._load()
+
+    def seal(plain: bytes, framing: str = "field") -> dict:
+        key = hashlib.sha256(mod.AT_REST_SECRET.encode()).digest()
+        nonce = os.urandom(12)
+        kid = "0123456789abcdef"
+        blob = AESGCM(key).encrypt(nonce, plain, mod.build_aad(kid, 1, framing))
+        env = {
+            "suite": 1,
+            "keyId": kid,
+            "nonce": base64.b64encode(nonce).decode(),
+            "authTag": base64.b64encode(blob[-16:]).decode(),
+            "ciphertext": base64.b64encode(blob[:-16]).decode(),
+        }
+        return {"$wbEncrypted": 1, "envelope": base64.b64encode(json.dumps(env).encode()).decode()}
+
+    sealed = seal(b"my-secret-token")
+    check("识别 $wbEncrypted 包装", wbtoken.is_encrypted(sealed))
+    check("round-trip 解密", wbtoken.unwrap(sealed) == "my-secret-token")
+
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "enc.info"
+        p.write_text(
+            json.dumps(
+                {
+                    "account": {"uid": "u-enc", "nickname": seal(b"Alice")},
+                    "auth": {
+                        "accessToken": seal(b"header.payload.sig"),
+                        "refreshToken": seal(b"refresh-abc"),
+                        "expiresAt": 4102444800000,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        a = parse_account(p)
+        check("加密 accessToken 解出明文", a.access_token == "header.payload.sig",
+              repr(a.access_token)[:70])
+        check("加密 refreshToken 解出明文", a.refresh_token == "refresh-abc")
+        check("加密 nickname 解出明文", a.nickname == "Alice")
+
+
 def test_model_extraction() -> None:
     print("\n[模型清单抽取]")
     real = {
@@ -813,6 +882,7 @@ def main() -> int:
     test_next_hour()
     test_cooldown_machine()
     test_auth_parse()
+    test_wb_encrypted_login()
     test_model_extraction()
     test_protocol_adapters()
     test_hardening()

@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from . import config as C
+from . import wbtoken
 
 # account 里可能承载企业 id 的字段名（个人账号通常全为空）。
 _ENTERPRISE_KEYS = ("enterpriseId", "enterprise_id", "tenantId", "tenant_id", "orgId")
@@ -111,8 +112,9 @@ def parse_account(path: str | Path) -> Account:
     if not account and isinstance(data.get("accounts"), list) and data["accounts"]:
         account = data["accounts"][0] or {}
 
-    token = auth.get("accessToken") or ""
-    if not token:
+    # 新版客户端把 token 加密成 $wbEncrypted；unwrap 对明文原样返回。
+    token = wbtoken.unwrap(auth.get("accessToken"), what="accessToken")
+    if not isinstance(token, str) or not token:
         raise RuntimeError(f"登录态文件里没有 accessToken，请先在桌面端登录：{p}")
 
     expires_at = int(auth.get("expiresAt") or 0)
@@ -127,9 +129,9 @@ def parse_account(path: str | Path) -> Account:
 
     return Account(
         uid=str(account.get("uid") or ""),
-        nickname=str(account.get("nickname") or ""),
+        nickname=str(wbtoken.unwrap(account.get("nickname"), what="nickname") or ""),
         access_token=token,
-        refresh_token=auth.get("refreshToken") or "",
+        refresh_token=wbtoken.unwrap(auth.get("refreshToken"), what="refreshToken") or "",
         expires_at_ms=expires_at,
         refresh_expires_at_ms=refresh_expires_at,
         domain=str(auth.get("domain") or ""),
@@ -213,6 +215,10 @@ def _write_back(acct: Account, changed: dict[str, Any]) -> None:
     except Exception:
         return
     auth = data.setdefault("auth", {})
+    if wbtoken.is_encrypted(auth.get("accessToken")):
+        # 客户端已改用加密格式，且它自己会定期刷新该文件。网关只解密不加密，
+        # 写明文回去会破坏客户端登录态 —— 这种情况只读不写。
+        return
     auth.update({k: v for k, v in changed.items() if v is not None})
     acct.auth.update({k: v for k, v in changed.items() if v is not None})
     try:
