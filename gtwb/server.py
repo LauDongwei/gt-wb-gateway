@@ -46,6 +46,10 @@ PASSTHROUGH_KEYS = {
 _MODEL_CACHE: dict[str, Any] = {"ids": [], "at": 0.0, "catalog": {}}
 MODEL_TTL_S = 3600
 
+# 客户端表达"最多生成多少 token"的两个字段名，语义相同。
+# 顺序即处理顺序：两个都在、都超限时各自独立钳到同一上限。
+MAX_TOKENS_FIELD_ORDER = ("max_tokens", "max_completion_tokens")
+
 # 抓包失败只提示一次，避免把日志刷爆
 _CAPTURE_WARNED = False
 
@@ -109,6 +113,13 @@ class Gateway:
         cat = await self.model_catalog()
         entry = cat.get(model) or cat.get("auto") or {}
         val = entry.get("maxInputTokens")
+        return val if isinstance(val, int) and val > 0 else None
+
+    async def model_max_output(self, model: str) -> int | None:
+        """取某模型的输出 token 上限；查不到返回 None（max_tokens 校验放行）。"""
+        cat = await self.model_catalog()
+        entry = cat.get(model) or cat.get("auto") or {}
+        val = entry.get("maxOutputTokens")
         return val if isinstance(val, int) and val > 0 else None
 
     # ── 账号 + 健康度 ─────────────────────────────────────────────────────
@@ -459,13 +470,18 @@ def build_app(gw: Gateway) -> FastAPI:
         if model != payload.get("model"):
             body["model"] = model
 
+        clamp_note = clamp_max_tokens(body, await gw.model_max_output(model))
+        if clamp_note:
+            obs.log(f"⚙ max_tokens 超模型上限，已钳制：{clamp_note}", rid)
+
         original_body = body
         body = _desensitize(body)
         stat = obs.RequestStat(model, "CHAT", rid)
         obs.log(
             f"▶ CHAT {model} | client={_tag_client(stat, request)}"
             f" | stream={wants_stream} | msgs={len(payload['messages'])}"
-            f" | tools={[t.get('function', {}).get('name') for t in (payload.get('tools') or [])] or '-'}",
+            f" | tools={[t.get('function', {}).get('name') for t in (payload.get('tools') or [])] or '-'}"
+            + (f" | clamp[{clamp_note}]" if clamp_note else ""),
             rid,
         )
         obs.debug(rid, "REQUEST BODY", body)
@@ -511,6 +527,10 @@ def build_app(gw: Gateway) -> FastAPI:
             body["model"] = model
 
         max_in = await gw.model_max_input(model)
+        max_out = await gw.model_max_output(model)
+        clamp_note = clamp_max_tokens(body, max_out)
+        if clamp_note:
+            obs.log(f"⚙ max_tokens 超模型上限，已钳制：{clamp_note}", rid)
         body, proj = project_responses_chat_body(body, max_input_tokens=max_in)
         body = _finalize(body)
         body = _desensitize(body)
@@ -522,7 +542,8 @@ def build_app(gw: Gateway) -> FastAPI:
             f" | projection[{proj.get('mode')}] msgs {proj.get('original_messages')}→{proj.get('projected_messages')}"
             f" chars {proj.get('original_message_chars')}→{proj.get('projected_message_chars')}"
             f" tools {proj.get('original_tools')}→{proj.get('projected_tools')}"
-            f" | max_in={max_in}",
+            f" | max_in={max_in} max_out={max_out}"
+            + (f" | clamp[{clamp_note}]" if clamp_note else ""),
             rid,
         )
         obs.debug(rid, "RESPONSES → CHAT BODY", body)
@@ -585,12 +606,17 @@ def build_app(gw: Gateway) -> FastAPI:
         if model != payload.get("model"):
             body["model"] = model
 
+        clamp_note = clamp_max_tokens(body, await gw.model_max_output(model))
+        if clamp_note:
+            obs.log(f"⚙ max_tokens 超模型上限，已钳制：{clamp_note}", rid)
+
         original_body = body
         body = _desensitize(body)
         stat = obs.RequestStat(model, "ANTHROPIC", rid)
         obs.log(
             f"▶ ANTHROPIC {model} | client={_tag_client(stat, request)}"
-            f" | msgs={len(body.get('messages') or [])}",
+            f" | msgs={len(body.get('messages') or [])}"
+            + (f" | clamp[{clamp_note}]" if clamp_note else ""),
             rid,
         )
         obs.debug(rid, "ANTHROPIC → CHAT BODY", body)
@@ -1240,6 +1266,32 @@ def _bad_request(msg: str) -> HTTPException:
         status_code=400,
         detail={"error": {"message": msg, "type": "invalid_request_error"}},
     )
+
+
+def clamp_max_tokens(body: dict[str, Any], max_output_tokens: int | None) -> str:
+    """把 body 里的 max_tokens / max_completion_tokens 钳到模型输出上限。
+
+    为什么需要（2026-10-09 补 P1）：客户端常写一个远超模型上限的值
+    （例如给输出上限 64k 的模型写 200k）。原样透传 → 上游 400 →
+    整条 agent 链路当场失败，客户端还以为自己坏了。这里就地钳制，
+    让请求继续活下去；钳了什么要让调用方知道（返回值 + 响应头）。
+
+    **上限未知时一律不动**（None / <=0）—— 拉不到元数据不能反过来改写
+    客户端参数，宁可让上游去判。
+
+    返回：变更说明（无变更返回空串）。
+    """
+    if not isinstance(max_output_tokens, int) or max_output_tokens <= 0:
+        return ""
+    changed: list[str] = []
+    for field in MAX_TOKENS_FIELD_ORDER:
+        raw = body.get(field)
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            continue
+        if raw > max_output_tokens:
+            body[field] = max_output_tokens
+            changed.append(f"{field} {raw}→{max_output_tokens}")
+    return "；".join(changed)
 
 
 def _upstream_error(status: int, raw: bytes, kind: Any = None) -> HTTPException:

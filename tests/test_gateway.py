@@ -996,6 +996,58 @@ def test_model_context() -> None:
     check("max_input_tokens 不污染上游 body", "max_input_tokens" not in out_1m, str(list(out_1m)))
 
 
+def test_max_tokens_clamp() -> None:
+    """max_tokens 超上限：钳到模型上限并告知，而不是让上游 400 打死整条 agent。
+
+    背景（2026-10-09）：客户端（Codex / CC Switch）常写一个远超模型上限的
+    max_tokens（例如给 192k 输出上限的模型写 200k）。原样透传 → 上游 400 →
+    整条 agent 链路当场失败，客户端还以为是自己坏了。P1 改为：能钳就钳、
+    钳不了才报错，且钳过之后要在日志与响应头里说清楚。
+    """
+    print("\n[max_tokens 校验与钳制]")
+    from gtwb.server import clamp_max_tokens, MAX_TOKENS_FIELD_ORDER
+
+    # ── 正常值：不动 ────────────────────────────────────────────────────
+    body = {"max_tokens": 8_000}
+    note = clamp_max_tokens(body, max_output_tokens=64_000)
+    check("未超限时 max_tokens 不变", body["max_tokens"] == 8_000, str(body))
+    check("未超限时无告知", note == "", repr(note))
+
+    # ── 超限：钳到上限 ──────────────────────────────────────────────────
+    body = {"max_tokens": 200_000}
+    note = clamp_max_tokens(body, max_output_tokens=64_000)
+    check("超限被钳到模型上限", body["max_tokens"] == 64_000, str(body))
+    check("超限给出告知文案", "200000" in note and "64000" in note, repr(note))
+
+    # ── 边界：恰好等于上限 → 不算超限 ───────────────────────────────────
+    body = {"max_tokens": 64_000}
+    note = clamp_max_tokens(body, max_output_tokens=64_000)
+    check("恰好等于上限不触发钳制", body["max_tokens"] == 64_000 and note == "",
+          f"{body} {note!r}")
+
+    # ── max_completion_tokens 是同一语义的别名，也要管 ───────────────────
+    body = {"max_completion_tokens": 999_999}
+    clamp_max_tokens(body, max_output_tokens=64_000)
+    check("max_completion_tokens 同样被钳", body["max_completion_tokens"] == 64_000, str(body))
+
+    # ── 两个字段并存且都超限：都钳，保持客户端给的原样优先级 ─────────────
+    body = {"max_tokens": 500_000, "max_completion_tokens": 400_000}
+    clamp_max_tokens(body, max_output_tokens=64_000)
+    check("并存时两字段都钳", body["max_tokens"] == 64_000 and body["max_completion_tokens"] == 64_000,
+          str(body))
+
+    # ── 模型上限未知（None / 0 / 负数）：一律不猜、不动 ──────────────────
+    for unknown in (None, 0, -1):
+        body = {"max_tokens": 123_456}
+        note = clamp_max_tokens(body, max_output_tokens=unknown)
+        check(f"上限={unknown!r} 时不改动", body["max_tokens"] == 123_456 and note == "",
+              f"{body} {note!r}")
+
+    check("字段顺序常量覆盖两种写法",
+          set(MAX_TOKENS_FIELD_ORDER) == {"max_tokens", "max_completion_tokens"},
+          str(MAX_TOKENS_FIELD_ORDER))
+
+
 def main() -> int:
     test_classify()
     test_next_hour()
@@ -1004,6 +1056,7 @@ def main() -> int:
     test_wb_encrypted_login()
     test_model_extraction()
     test_model_context()
+    test_max_tokens_clamp()
     test_protocol_adapters()
     test_tool_namespace_rename()
     test_hardening()
