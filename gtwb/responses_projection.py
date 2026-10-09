@@ -153,6 +153,27 @@ KEEP_RATIO = 0.6
 MIN_MESSAGE_BUDGET = 100_000
 SUMMARY_SHARE = 0.25          # 预算里分给"历史摘要"的比例，其余给最近的完整消息
 
+# 上下文容量 → 字符预算的换算是经验值（中英混排约 3 字符/token）。
+# 取容量的 70% 作为"透明档安全线"：留 30% 给工具 schema、语言规则与输出。
+CHARS_PER_TOKEN = 3
+CAPACITY_SAFE_RATIO = 0.7
+
+
+def transparent_char_limit_for(max_input_tokens: int | None) -> int:
+    """按模型真实上下文容量算透明档阈值。
+
+    2026-10-09 修：此前 TRANSPARENT_CHAR_LIMIT 是写死的 600k 字符，跟模型能力无关。
+    对 1M token 的模型（deepseek-v4.1-flash / glm-5.3 / kimi-k3-1 …）而言，
+    600k 字符 ≈ 180k token ≈ **容量的 18%** —— 会话一过这个点就进弹性档，
+    每轮滑窗 + 重新摘要 → 消息序列每轮都变 → **上游 KV 前缀缓存整段失效**
+    （实测命中率 96% → 6.6%）。现在改成跟着模型容量走。
+    """
+    if not max_input_tokens or max_input_tokens <= 0:
+        return TRANSPARENT_CHAR_LIMIT
+    scaled = int(max_input_tokens * CHARS_PER_TOKEN * CAPACITY_SAFE_RATIO)
+    # 不缩到手写常量以下（保住既有行为），也不无限膨胀（上游实测仅验证到 ~877k 字符）
+    return max(TRANSPARENT_CHAR_LIMIT, scaled)
+
 # 单条消息/单块内容的截断上限。数值偏大是刻意的：Codex 的 instructions
 # 有 2 万字符左右，工具描述是模型选对工具的唯一依据，都不能按"摘要"对待。
 MAX_SYSTEM_GUIDANCE_CHARS = 24_000
@@ -187,8 +208,14 @@ SCHEMA_KEEP_KEYS = {
 }
 
 
-def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
-    """把 Responses 转出来的 Chat body 投影成更适合腾讯后端的最小上下文。"""
+def project_responses_chat_body(
+    body: dict, max_input_tokens: int | None = None
+) -> tuple[dict, dict]:
+    """把 Responses 转出来的 Chat body 投影成更适合腾讯后端的最小上下文。
+
+    `max_input_tokens` 是**网关按当前请求模型容量注入的入参，不是 body 字段**
+    （body 会整体发给上游，多一个未知字段会触发上游校验失败）。
+    """
     projected = dict(body)
     messages = list(body.get("messages") or [])
     tools = list(body.get("tools") or [])
@@ -200,10 +227,11 @@ def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
         projected["tools"] = []
 
     lang_rule = _language_rule(messages)
+    char_limit = transparent_char_limit_for(max_input_tokens)
 
     # ---- 透明模式：上下文在安全阈值内时原样透传，模型看到的就是 Codex 发的 ----
     # （学习 sub2api：网关不改写对话内容，模型才能发挥原有水准）
-    if _messages_size(messages) <= TRANSPARENT_CHAR_LIMIT:
+    if _messages_size(messages) <= char_limit:
         transparent_msgs = messages
         if lang_rule:
             applied = False

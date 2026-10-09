@@ -877,6 +877,125 @@ def test_upstream_config() -> None:
           cfg.web_origin == "https://intl.origin.example", cfg.web_origin)
 
 
+def test_tool_namespace_rename() -> None:
+    """namespace 工具重名改名后，必须把「正确调用名」写进描述。
+
+    2026-10-08 实证：本机 mcp__cua_repl（浏览器）与 mcp__node_repl（桌面）都暴露
+    `js`，网关只能改名成 cua_repl__js / node_repl__js 才能区分。但 DeepSeek-v4.1-flash
+    仍按裸名 `js` 调了 299 次，Codex 一律回 `unsupported call: js`，单轮烧掉 5700 万
+    token 还不出结果。描述（description）是模型唯一稳定读到的字段 —— 改名后必须把
+    可调用名显式写进描述。
+    """
+    from gtwb.responses_adapter import _convert_tools_for_chat
+
+    tools = [
+        {"type": "namespace", "name": "mcp__cua_repl", "description": "browser surface",
+         "tools": [{"type": "function", "name": "js", "description": "run js"},
+                   {"type": "function", "name": "js_reset", "description": "reset repl"}]},
+        {"type": "namespace", "name": "mcp__node_repl", "description": "desktop surface",
+         "tools": [{"type": "function", "name": "js", "description": "run js"},
+                   {"type": "function", "name": "js_reset", "description": "reset repl"}]},
+        {"type": "function", "name": "exec_command", "description": "run shell"},
+    ]
+    chat, route, _internal = _convert_tools_for_chat(tools, enable_web_search=False)
+    names = [t["function"]["name"] for t in chat]
+    by_name = {t["function"]["name"]: t["function"] for t in chat}
+
+    check("重名 js 改成带 namespace 前缀",
+          "cua_repl__js" in names and "node_repl__js" in names, str(names))
+    check("不重名的工具保持原名",
+          "exec_command" in names, str(names))
+    check("裸名 js 不在模型可见清单里", "js" not in names, str(names))
+    check("路由表可还原 namespace",
+          route.get("cua_repl__js") == ("mcp__cua_repl", "js"),
+          str(route.get("cua_repl__js")))
+
+    desc_cua = by_name["cua_repl__js"].get("description") or ""
+    check("改名后的描述写明正确调用名",
+          'Call this tool using name "cua_repl__js"' in desc_cua, repr(desc_cua)[:160])
+    check("改名后的描述保留原始说明", "run js" in desc_cua, repr(desc_cua)[:160])
+    check("另一个重名工具也被标注",
+          'Call this tool using name "node_repl__js"' in
+          (by_name["node_repl__js"].get("description") or ""),
+          repr(by_name["node_repl__js"].get("description"))[:160])
+    check("未改名的工具描述不被污染",
+          "Call this tool using name" not in (by_name["exec_command"].get("description") or ""),
+          repr(by_name["exec_command"].get("description")))
+
+
+def test_model_context() -> None:
+    """模型上下文能力：上游给的 contextWindow / maxInputTokens 必须保住并对外暴露。
+
+    背景（2026-10-09）：上游 `data.models[]` 每条都带 maxInputTokens / maxOutputTokens /
+    maxAllowedSize / contextWindow{defaultLength,supportedLengths}，但早期实现只抽 id
+    字符串，其余全丢 → `/v1/models` 无法告知下游"这个模型能吃多少上下文"；
+    且投影层用写死的 TRANSPARENT_CHAR_LIMIT=600k 字符，**在 1M 模型的 18% 处就开始裁剪**，
+    每轮改写消息序列 → 上游 KV 缓存整段失效（命中率 96%→6.6%）。
+    """
+    print("\n[模型上下文能力]")
+    from gtwb.upstream import _extract_model_catalog
+    import gtwb.responses_projection as RP
+
+    live = {
+        "code": 0,
+        "data": {
+            "agents": [
+                {"name": "cli", "tags": ["cli", "default"],
+                 "models": ["auto", "deepseek-v4.1-flash", "glm-5.3"]},
+            ],
+            "models": [
+                {"id": "auto", "isDefault": True, "maxInputTokens": 256_000,
+                 "maxOutputTokens": 32_000, "credits": "x0.29"},
+                {"id": "deepseek-v4.1-flash", "maxInputTokens": 1_000_000,
+                 "maxOutputTokens": 128_000, "maxAllowedSize": 1_000_000,
+                 "contextWindow": {"defaultLength": 300_000,
+                                   "supportedLengths": [300_000, 600_000, 1_000_000]}},
+                {"id": "glm-5.3", "maxInputTokens": 1_000_000,
+                 "maxOutputTokens": 64_000, "maxAllowedSize": 1_000_000,
+                 "contextWindow": {"defaultLength": 300_000,
+                                   "supportedLengths": [300_000, 600_000, 1_000_000]}},
+                # 目录里存在但不在主 CLI agent 清单内 → 不该暴露（沿用 id 抽取口径）
+                {"id": "glm-4.6", "maxInputTokens": 168_000, "maxOutputTokens": 32_000},
+            ],
+        },
+    }
+
+    cat = _extract_model_catalog(live)
+    check("catalog 是 dict", isinstance(cat, dict), type(cat).__name__)
+    # 口径与 _extract_model_ids 一致：主 agent 的模型 + 上游认的 default 别名
+    check("catalog 与 id 清单口径一致",
+          set(cat) == {"auto", "deepseek-v4.1-flash", "glm-5.3", "default"},
+          str(sorted(cat)))
+    check("目录外模型不混入（glm-4.6）", "glm-4.6" not in cat)
+
+    d = cat.get("deepseek-v4.1-flash") or {}
+    check("保住 maxInputTokens", d.get("maxInputTokens") == 1_000_000, str(d.get("maxInputTokens")))
+    check("保住 maxOutputTokens", d.get("maxOutputTokens") == 128_000, str(d.get("maxOutputTokens")))
+    check("保住 contextWindow.supportedLengths",
+          (d.get("contextWindow") or {}).get("supportedLengths") == [300_000, 600_000, 1_000_000],
+          str(d.get("contextWindow")))
+    check("保住 credits 等元数据", d.get("maxAllowedSize") == 1_000_000, str(d.get("maxAllowedSize")))
+
+    # ── 投影阈值必须按模型容量动态算，而不是写死 600k 字符 ─────────────────
+    cap_1m = RP.transparent_char_limit_for(max_input_tokens=1_000_000)
+    cap_192k = RP.transparent_char_limit_for(max_input_tokens=192_000)
+    check("1M 模型的透明阈值远高于 600k", cap_1m > 600_000, f"1M→{cap_1m}")
+    check("192k 模型的透明阈值低于 1M 模型", cap_192k < cap_1m, f"192k→{cap_192k}")
+    check("未知容量回落到默认常量", RP.transparent_char_limit_for(None) == RP.TRANSPARENT_CHAR_LIMIT,
+          str(RP.transparent_char_limit_for(None)))
+
+    # 同一份 700k 字符会话：写死阈值会压缩，1M 模型应留在透明档
+    big = [{"role": "user", "content": "x" * 700_000}]
+    _, meta_default = RP.project_responses_chat_body({"messages": big})
+    out_1m, meta_1m = RP.project_responses_chat_body({"messages": big}, max_input_tokens=1_000_000)
+    check("默认阈值下 700k 不进透明档", meta_default.get("mode") != "transparent",
+          str(meta_default.get("mode")))
+    check("1M 模型下 700k 留在透明档", meta_1m.get("mode") == "transparent",
+          str(meta_1m.get("mode")))
+    # max_input_tokens 是入参、不是 body 字段：绝不能漏进发往上游的 body
+    check("max_input_tokens 不污染上游 body", "max_input_tokens" not in out_1m, str(list(out_1m)))
+
+
 def main() -> int:
     test_classify()
     test_next_hour()
@@ -884,7 +1003,9 @@ def main() -> int:
     test_auth_parse()
     test_wb_encrypted_login()
     test_model_extraction()
+    test_model_context()
     test_protocol_adapters()
+    test_tool_namespace_rename()
     test_hardening()
     test_client_identity()
     test_client_attribution()

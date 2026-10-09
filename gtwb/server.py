@@ -43,7 +43,7 @@ PASSTHROUGH_KEYS = {
     "parallel_tool_calls", "prompt_cache_key",
 }
 
-_MODEL_CACHE: dict[str, Any] = {"ids": [], "at": 0.0}
+_MODEL_CACHE: dict[str, Any] = {"ids": [], "at": 0.0, "catalog": {}}
 MODEL_TTL_S = 3600
 
 # 抓包失败只提示一次，避免把日志刷爆
@@ -88,6 +88,28 @@ class Gateway:
             _MODEL_CACHE["ids"] = ids
             _MODEL_CACHE["at"] = now
         return ids or list(_MODEL_CACHE["ids"])
+
+    async def model_catalog(self) -> dict[str, dict[str, Any]]:
+        """模型能力档案（上下文长度等）。与 model_ids 共用同一份 TTL 缓存。"""
+        now = time.time()
+        if _MODEL_CACHE["catalog"] and now - _MODEL_CACHE["at"] < MODEL_TTL_S:
+            return _MODEL_CACHE["catalog"]
+        try:
+            acct = await self.accounts.current()
+            cat = await upstream.fetch_model_catalog(self.cfg, acct)
+        except Exception:
+            cat = {}
+        if cat:
+            _MODEL_CACHE["catalog"] = cat
+            _MODEL_CACHE["at"] = now
+        return cat or dict(_MODEL_CACHE["catalog"])
+
+    async def model_max_input(self, model: str) -> int | None:
+        """取某模型的输入 token 上限；查不到返回 None（投影层回落默认阈值）。"""
+        cat = await self.model_catalog()
+        entry = cat.get(model) or cat.get("auto") or {}
+        val = entry.get("maxInputTokens")
+        return val if isinstance(val, int) and val > 0 else None
 
     # ── 账号 + 健康度 ─────────────────────────────────────────────────────
     async def pick(self) -> tuple[Any, str]:
@@ -260,16 +282,34 @@ def build_app(gw: Gateway) -> FastAPI:
     async def list_models(
         authorization: str | None = Header(default=None),
         x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+        detail: str | None = None,
     ):
         gw.check_auth(authorization, x_api_key)
         ids = await gw.model_ids()
-        return {
-            "object": "list",
-            "data": [
-                {"id": m, "object": "model", "created": 1700000000, "owned_by": "workbuddy"}
-                for m in ids
-            ],
-        }
+        catalog = await gw.model_catalog()
+        full = (detail or "").lower() == "full"
+
+        def _entry(mid: str) -> dict[str, Any]:
+            item: dict[str, Any] = {
+                "id": mid, "object": "model", "created": 1700000000, "owned_by": "workbuddy",
+            }
+            info = catalog.get(mid) or {}
+            max_in = info.get("maxInputTokens")
+            max_out = info.get("maxOutputTokens")
+            # OpenAI 兼容字段：下游（Codex / CC Switch / Mac）据此自动感知上下文
+            if isinstance(max_in, int) and max_in > 0:
+                item["context_length"] = max_in
+            if isinstance(max_out, int) and max_out > 0:
+                item["max_output_tokens"] = max_out
+            if full:
+                for k in ("maxAllowedSize", "contextWindow", "credits", "vendor", "name",
+                          "supportsImages", "supportsToolCall", "supportsReasoning",
+                          "onlyReasoning", "isDefault"):
+                    if k in info:
+                        item[k] = info[k]
+            return item
+
+        return {"object": "list", "data": [_entry(m) for m in ids]}
 
     # ══════════════════════════════════════════════════════════════════════
     # 请求体准备
@@ -461,23 +501,28 @@ def build_app(gw: Gateway) -> FastAPI:
         if internal_tools:
             obs.log(f"⇄ 网关代跑工具：{sorted(internal_tools)}")
 
-        body, proj = project_responses_chat_body(body)
-        body = _finalize(body)
-        body = _desensitize(body)
-
+        # 先定模型：投影阈值要按该模型的真实上下文容量算（否则会写死 600k 字符，
+        # 在 1M 模型上等于容量的 18% 就开始裁剪 → 每轮改写消息序列 → 上游 KV 缓存全灭）
         rid = obs.new_rid()
         model, model_note = await gw.resolve_model(payload.get("model", "auto"))
         if model_note:
             obs.log(f"↪ 模型名替换：{model_note}", rid)
         if model != payload.get("model"):
             body["model"] = model
+
+        max_in = await gw.model_max_input(model)
+        body, proj = project_responses_chat_body(body, max_input_tokens=max_in)
+        body = _finalize(body)
+        body = _desensitize(body)
+
         stat = obs.RequestStat(model, "RESPONSES", rid)
         obs.log(
             f"▶ RESPONSES {model} | client={_tag_client(stat, request)}"
             f" | input_items={len(payload.get('input') or [])}"
             f" | projection[{proj.get('mode')}] msgs {proj.get('original_messages')}→{proj.get('projected_messages')}"
             f" chars {proj.get('original_message_chars')}→{proj.get('projected_message_chars')}"
-            f" tools {proj.get('original_tools')}→{proj.get('projected_tools')}",
+            f" tools {proj.get('original_tools')}→{proj.get('projected_tools')}"
+            f" | max_in={max_in}",
             rid,
         )
         obs.debug(rid, "RESPONSES → CHAT BODY", body)

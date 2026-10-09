@@ -297,6 +297,74 @@ def _extract_model_ids(data: dict[str, Any]) -> list[str]:
     return out
 
 
+# 对外保留的能力字段：上游 data.models[] 带全了，早期只抽 id 全丢了，
+# 导致 /v1/models 无法告知下游"这个模型能吃多少上下文"。
+CATALOG_FIELDS = (
+    "maxInputTokens",
+    "maxOutputTokens",
+    "maxAllowedSize",
+    "contextWindow",
+    "credits",
+    "vendor",
+    "name",
+    "supportsImages",
+    "supportsToolCall",
+    "supportsReasoning",
+    "onlyReasoning",
+    "disabledMultimodal",
+    "isDefault",
+)
+
+
+def _extract_model_catalog(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """抽出**对外可用**模型的能力档案：{model_id: {maxInputTokens, contextWindow, ...}}。
+
+    口径与 `_extract_model_ids()` **严格一致**（同一份清单、同一套权威层），
+    否则会出现"清单里有这个模型、能力表里查不到"的错配。
+    """
+    ids = _extract_model_ids(data)
+    if not ids:
+        return {}
+
+    # 把 data.models[] 摊平成 id -> 原始条目
+    by_id: dict[str, dict[str, Any]] = {}
+    inner = data.get("data") if isinstance(data, dict) else None
+    raw_catalog: list[Any] = []
+    if isinstance(inner, dict):
+        raw_catalog.extend(inner.get("models") or [])
+    if isinstance(data, dict):
+        raw_catalog.extend(data.get("models") or [])
+    for m in raw_catalog:
+        if isinstance(m, dict) and isinstance(m.get("id"), str):
+            by_id.setdefault(m["id"], m)
+
+    catalog: dict[str, dict[str, Any]] = {}
+    for mid in ids:
+        entry = by_id.get(mid)
+        if not isinstance(entry, dict):
+            catalog[mid] = {}
+            continue
+        catalog[mid] = {k: entry[k] for k in CATALOG_FIELDS if k in entry}
+    return catalog
+
+
+async def fetch_model_catalog(cfg: C.Config, acct: Account) -> dict[str, dict[str, Any]]:
+    """拉模型能力档案（含上下文长度）。口径同 `fetch_models`，失败返回空表。"""
+    try:
+        status, data = await post_json(
+            cfg,
+            acct,
+            C.MODELS_PATH,
+            {},
+            headers={**chat_headers(cfg, acct), "Content-Type": "application/json"},
+        )
+        if status != 200 or not isinstance(data, dict) or data.get("code") != 0:
+            status, data = await _get_models(cfg, acct)
+        return _extract_model_catalog(data)
+    except Exception:
+        return {}
+
+
 def _local_fallback_models() -> list[str]:
     """本地兜底：WorkBuddy 的 product.json → 内置表。"""
     import os
