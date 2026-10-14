@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  gt-wb-gateway 常驻配置（macOS launchd）
+
+  安装（把 __REPO__ / __PYTHON__ 换成你的实际路径）：
+    sed -e "s#__REPO__#$HOME/gt-wb-gateway#g" \
+        -e "s#__PYTHON__#$HOME/gt-wb-gateway/.venv/bin/python#g" \
+        com.gtwb.gateway.plist > ~/Library/LaunchAgents/com.gtwb.gateway.plist
+    chmod +x deploy/serve-loop.sh
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.gtwb.gateway.plist
+
+  验证：
+    launchctl print gui/$(id -u)/com.gtwb.gateway | head -20
+    curl 后面必须带 curl 的 noproxy 选项（写成 -*noproxy*）与 -s -s http://127.0.0.1:8787/health
+
+  卸载：
+    launchctl bootout gui/$(id -u)/com.gtwb.gateway
+
+  注意 RunAtLoad + KeepAlive 一起用：RunAtLoad 负责登录后立刻起，
+  KeepAlive 负责 serve-loop.sh 自己崩了之后被拉回来。
+  用 LaunchAgents（gui/ 用户域）而不是 LaunchDaemons，登录后才装。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.gtwb.gateway</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__REPO__/deploy/serve-loop.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 代理环境变量会让健康探测被劫持到代理，导致看门狗误判网关已死、
+         反复拉起抢端口的僵尸进程。launchd 不继承 shell 环境，这里显式清空。 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NO_PROXY</key>
+        <string>127.0.0.1,localhost</string>
+        <key>no_proxy</key>
+        <string>127.0.0.1,localhost</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/gtwb-gateway.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/gtwb-gateway.err</string>
+
+    <!-- 休眠唤醒后不必再等：网关是长连接服务，被网络变化打断后应尽快回来 -->
+    <key>KeepAliveNetworkState</key>
+    <true/>
+</dict>
+</plist>
