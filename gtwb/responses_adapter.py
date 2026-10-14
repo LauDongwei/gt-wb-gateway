@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections import Counter
 from typing import Any
@@ -54,12 +55,23 @@ def responses_request_to_chat(body: dict, enable_web_search: bool = True
     if instructions:
         messages.append({"role": "system", "content": instructions})
 
+    # tools — Responses 和 Chat 的 function tool 格式略有不同
+    # ⚠ 必须先转 tools：_convert_input_items 需要 name_route 把历史 function_call
+    # 的裸名映射回上游可见名（见 _route_upstream_name 的注释）。
+    tools = body.get("tools")
+    if tools:
+        chat_tools, name_route, internal_tools = _convert_tools_for_chat(
+            tools, enable_web_search=enable_web_search
+        )
+    else:
+        chat_tools = []
+
     # input → messages
     inp = body.get("input", [])
     if isinstance(inp, str):
         messages.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
-        messages.extend(_convert_input_items(inp))
+        messages.extend(_convert_input_items(inp, name_route))
 
     # 构造 Chat body
     chat: dict[str, Any] = {"messages": messages, "stream": True}
@@ -67,15 +79,8 @@ def responses_request_to_chat(body: dict, enable_web_search: bool = True
     # model
     if "model" in body:
         chat["model"] = body["model"]
-
-    # tools — Responses 和 Chat 的 function tool 格式略有不同
-    tools = body.get("tools")
-    if tools:
-        chat_tools, name_route, internal_tools = _convert_tools_for_chat(
-            tools, enable_web_search=enable_web_search
-        )
-        if chat_tools:
-            chat["tools"] = chat_tools
+    if chat_tools:
+        chat["tools"] = chat_tools
     if "tool_choice" in body:
         chat["tool_choice"] = _convert_tool_choice(body["tool_choice"])
 
@@ -107,7 +112,65 @@ def responses_request_to_chat(body: dict, enable_web_search: bool = True
     return chat, name_route, internal_tools
 
 
-def _convert_input_items(items: list) -> list[dict]:
+# 各 MCP 表面 JS 运行时的**专属 API 特征**。用于「历史裸名调用没有 namespace
+# 字段、而该裸名又有多个上游候选」时，按代码里实际用的是哪个表面的 API 来分流。
+# 这是代码内容里的客观事实，不是猜。命中 0 个或 >1 个（有歧义，如同一段代码
+# 同时用了两个表面的 API）→ 不映射，宁可留裸名也不路由错表面。
+_SURFACE_CODE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("cua", (r"\bcua\.", "createBrowserTab", "getAXState")),
+    ("node", (r"\bnodeRepl\.", r"\bdesktop\.", "child_process", "electron")),
+)
+
+
+def _match_surface_by_code(ns: str, args: str) -> bool:
+    """判断一段工具调用代码是否明确属于某个 MCP 表面。"""
+    if not ns or not args:
+        return False
+    low = ns.lower()
+    code = args[:4000]
+    for key, markers in _SURFACE_CODE_MARKERS:
+        if key in low:
+            # markers 是正则（要用 \b 之类），必须走 re.search，不能用 `in`
+            return any(re.search(m, code) for m in markers)
+    return False
+
+
+def _route_upstream_name(bare: str, ns: str, route: dict,
+                         args: str = "") -> str:
+    """把客户端发回的历史调用名（裸名）映射回上游可见名。
+
+    背景（2026-10-13 实证，step-5-preview + Codex 0.162）：上游工具定义用的是
+    改名后的名字（重名工具加 `<ns>__` 前缀，如 `cua_repl__js`），而客户端回传
+    历史 function_call 时用的是裸名，且**只在本轮新建的调用上带 namespace**
+    （实测 284 条历史里仅 4 条带、213 条裸名无字段）。若历史里直接放裸名，上游
+    看到「工具定义叫 cua_repl__js、历史调用却叫 js」——模型模仿历史继续裸调 →
+    网关 name_route 查不到 → 原样透传 → 客户端 `unsupported call: js` →
+    错误结果再进历史 → 死循环（实测 210 轮空转、单会话烧 2700 万 input token）。
+
+    匹配优先级：裸名本身是上游名 → (namespace, 裸名) 精确匹配 → 裸名唯一匹配
+    → **裸名多候选时按代码里的表面 API 特征分流**。全部匹配不上就原样返回——
+    宁可不映射，也不能瞎映射到错误的 MCP 服务器。
+    """
+    if not route or not bare:
+        return bare
+    if bare in route:  # 工具未改名，裸名即上游名
+        return bare
+    if ns:
+        for up, (v_ns, v_bare) in route.items():
+            if v_ns == ns and v_bare == bare:
+                return up
+    hits = [up for up, (_v_ns, v_bare) in route.items() if v_bare == bare]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1 and args:
+        matched = [up for up in hits
+                   if _match_surface_by_code(route[up][0], args)]
+        if len(matched) == 1:  # 唯一命中才映射，有歧义/无特征都不动
+            return matched[0]
+    return bare
+
+
+def _convert_input_items(items: list, name_route: dict | None = None) -> list[dict]:
     """将 Responses API 的 input 数组转换为 Chat messages。
 
     input 里可能包含：
@@ -115,7 +178,39 @@ def _convert_input_items(items: list) -> list[dict]:
       - {"type": "message", ...}                      → 助手消息
       - {"type": "function_call", ...}                → 需合并到前面的助手消息
       - {"type": "function_call_output", ...}         → tool 角色
+
+    name_route 是 tools 转换得到的 上游可见名→(namespace, 裸名) 路由表。
+    历史 function_call 的 name 必须经它映射回上游可见名，否则模型会模仿
+    历史里的裸名调用，触发 `unsupported call` 死循环（见 _route_upstream_name）。
     """
+    # ── 预扫描：裸名多候选时的「会话级多数派」归属 ──────────────────────
+    # 个别历史调用的代码同时用了两个表面的 API（特征判定有歧义），单条判不了。
+    # 但同一会话里绝大多数裸名调用通常归属同一表面（实测 284 条里 211 条明确
+    # 指向浏览器表面），把剩下少量有歧义的按多数派归位，才能让「工具定义 vs
+    # 历史示范」彻底自洽——否则模型照着这几条残缺示范继续裸调，死循环复发。
+    # 只用于历史回放示范；模型新发调用的路由不受影响（出站兜底另算）。
+    bare_majority: dict[str, str] = {}
+    if name_route:
+        tally: dict[str, dict[str, int]] = {}
+        for _it in items:
+            if not isinstance(_it, dict) or _it.get("type") != "function_call":
+                continue
+            _bare = str(_it.get("name") or "")
+            if not _bare or _bare in name_route or _it.get("namespace"):
+                continue
+            _cands = [u for u, (_n, b) in name_route.items() if b == _bare]
+            if len(_cands) < 2:
+                continue
+            _up = _route_upstream_name(_bare, "", name_route,
+                                        str(_it.get("arguments") or ""))
+            if _up != _bare:
+                _slot = tally.setdefault(_bare, {})
+                _slot[_up] = _slot.get(_up, 0) + 1
+        for _bare, _c in tally.items():
+            _top, _n = max(_c.items(), key=lambda kv: kv[1])
+            if _n * 2 > sum(_c.values()):  # 必须过半才算多数派
+                bare_majority[_bare] = _top
+
     messages: list[dict] = []
     # 临时缓存：合并相邻的 assistant message 和 function_call
     pending_assistant_content: str | None = None
@@ -217,11 +312,25 @@ def _convert_input_items(items: list) -> list[dict]:
         if item_type == "function_call":
             if pending_assistant_content is None:
                 pending_assistant_content = ""
+            # 历史调用名必须映射回上游可见名：上游工具定义用改名后的名字
+            # （如 cua_repl__js），客户端回传的是裸名 + namespace。直接放裸名
+            # 会让上游看到「定义与历史不一致」，模型模仿历史裸调 → unsupported
+            # call 死循环（2026-10-13 实证 210 轮）。
+            up_name = _route_upstream_name(
+                str(item.get("name") or ""),
+                str(item.get("namespace") or ""),
+                name_route or {},
+                str(item.get("arguments") or ""),
+            )
+            # 特征判定不了（有歧义/无特征）→ 落到会话级多数派
+            if up_name == str(item.get("name") or "") and bare_majority:
+                up_name = bare_majority.get(
+                    str(item.get("name") or ""), up_name)
             pending_tool_calls.append({
                 "id": item.get("call_id", item.get("id", _rand_id("call_"))),
                 "type": "function",
                 "function": {
-                    "name": item.get("name", ""),
+                    "name": up_name,
                     "arguments": item.get("arguments", "{}"),
                 },
             })
@@ -470,6 +579,8 @@ def _convert_tools_for_chat(tools: list, enable_web_search: bool = True
     `mcp__cua_repl.js` 与 `mcp__node_repl.js`。早期实现按「先到先得」丢弃后者，
     模型仍会调用 `js`，结果被路由到 **错误** 的 MCP 服务器（比缺工具更危险）。
     现在重名的统一加 `<ns>__` 前缀保证唯一，路由时再还原。
+    改名后还必须把可调用名写进 description —— 模型（尤其小模型）会照描述里的
+    写法调用，只改 name 会让它一直按裸名调，客户端报 `unsupported call`。
 
     托管型工具 `{"type":"web_search"}` 上游承接不了（实测静默忽略），
     改为降级成一个普通 function 交给网关自己执行检索（见 `websearch.py`）。
@@ -520,8 +631,15 @@ def _convert_tools_for_chat(tools: list, enable_web_search: bool = True
                     continue
                 up = _unique(bare, ns_hint)
                 fn: dict[str, Any] = {"name": up}
-                if sub.get("description"):
-                    fn["description"] = sub["description"]
+                desc = sub.get("description")
+                if up != bare:
+                    # 改名后模型极易仍按裸名（如 "js"）发起调用，客户端一律回
+                    # `unsupported call: js`，模型在重试里把上下文烧光（2026-10-08
+                    # 实测单轮 300+ 次失败 / 5700 万 token）。描述是模型唯一稳定
+                    # 读到的字段，这里显式写明可调用名。
+                    desc = f'[Call this tool using name "{up}" (not "{bare}").] ' + (desc or "")
+                if desc:
+                    fn["description"] = desc
                 if "parameters" in sub:
                     fn["parameters"] = sub["parameters"]
                 if "strict" in sub:
@@ -933,6 +1051,14 @@ class ResponsesStreamConverter:
         # 重名工具在上游侧被加了 `<ns>__` 前缀，这里必须把 name 改回原始裸名，
         # 否则客户端会找不到该工具。
         route = self.name_route.get(tc["name"])
+        if not route and tc.get("name"):
+            # 兜底：模型没按 description 的提示用新名，仍发裸名（如 "js"）。
+            # 若路由表里该裸名唯一对应一个上游工具，自动按它路由——
+            # 客户端拿到 namespace 就能正确执行，不必再报 unsupported call。
+            hits = [k for k, v in self.name_route.items()
+                    if v[1] == tc["name"]]
+            if len(hits) == 1:
+                route = self.name_route[hits[0]]
         if route:
             ns, orig = route
             if ns:

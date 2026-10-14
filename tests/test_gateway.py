@@ -923,6 +923,183 @@ def test_tool_namespace_rename() -> None:
           repr(by_name["exec_command"].get("description")))
 
 
+def test_history_call_name_routing() -> None:
+    """历史 function_call 的裸名必须映射回上游可见名（2026-10-13 P0 修复）。
+
+    实证（step-5-preview + Codex 0.162，会话 01a130d7）：前 4 次调用带
+    namespace 正常执行，16:17:02 起 210 次全部退化为裸名 `js`，客户端一律
+    `unsupported call: js`，单会话空烧 2700 万 input token、零交付，最后
+    codex 进程僵死。根因：客户端回传历史 function_call 用「裸名 + namespace」，
+    网关却把裸名原样转给上游，而工具定义里是改名后的 `cua_repl__js` ——
+    上游看到「定义与历史不一致」，模型模仿历史继续裸调 → name_route 查不到
+    → 原样透传 → unsupported → 错误再进历史 → 死循环。
+    """
+    print("\n[历史调用名路由映射]")
+    from gtwb.responses_adapter import (
+        _convert_input_items, _route_upstream_name,
+        responses_request_to_chat, ResponsesStreamConverter,
+    )
+
+    route = {
+        "cua_repl__js": ("mcp__cua_repl", "js"),
+        "node_repl__js": ("mcp__node_repl", "js"),
+        "exec_command": ("", "exec_command"),
+    }
+
+    # ── 1) 映射函数逐项 ────────────────────────────────────────────
+    check("带 namespace 的裸名映射到唯一上游名",
+          _route_upstream_name("js", "mcp__cua_repl", route) == "cua_repl__js",
+          _route_upstream_name("js", "mcp__cua_repl", route))
+    check("另一个 namespace 映射到另一个上游名",
+          _route_upstream_name("js", "mcp__node_repl", route) == "node_repl__js",
+          _route_upstream_name("js", "mcp__node_repl", route))
+    check("未改名的工具名原样返回",
+          _route_upstream_name("exec_command", "", route) == "exec_command",
+          _route_upstream_name("exec_command", "", route))
+    check("两个重名工具无 namespace 信息时不瞎映射",
+          _route_upstream_name("js", "", route) == "js",
+          _route_upstream_name("js", "", route))
+    check("namespace 对不上时原样返回",
+          _route_upstream_name("js", "mcp__unknown", route) == "js",
+          _route_upstream_name("js", "mcp__unknown", route))
+    check("空路由表原样返回", _route_upstream_name("js", "", {}) == "js", "")
+    check("空名不炸", _route_upstream_name("", "", route) == "", "")
+
+    # ── 2) 端到端：完整请求体转换 ─────────────────────────────────
+    body = {
+        "model": "step-5-preview",
+        "instructions": "You are Codex.",
+        "input": [
+            {"type": "message", "role": "user", "content": "打开浏览器"},
+            {"type": "function_call", "name": "js",
+             "namespace": "mcp__cua_repl",
+             "arguments": '{"code": "await cua.getState();"}',
+             "call_id": "chatcmpl-tool-001"},
+            {"type": "function_call_output", "call_id": "chatcmpl-tool-001",
+             "output": "Wall time: 0.3 seconds"},
+            {"type": "function_call", "name": "exec_command",
+             "arguments": '{"cmd": "ls"}',
+             "call_id": "chatcmpl-tool-002"},
+            {"type": "function_call_output", "call_id": "chatcmpl-tool-002",
+             "output": "file1"},
+        ],
+        "tools": [
+            {"type": "namespace", "name": "mcp__cua_repl",
+             "tools": [{"type": "function", "name": "js",
+                        "description": "browser js"}]},
+            {"type": "namespace", "name": "mcp__node_repl",
+             "tools": [{"type": "function", "name": "js",
+                        "description": "desktop js"}]},
+            {"type": "function", "name": "exec_command",
+             "description": "run shell"},
+        ],
+    }
+    chat, route2, _internal = responses_request_to_chat(body, enable_web_search=False)
+    asst = [m for m in chat["messages"] if m.get("role") == "assistant"]
+    hist_names = [tc["function"]["name"] for m in asst
+                  for tc in m.get("tool_calls", [])]
+    check("历史 function_call 映射为上游可见名",
+          "cua_repl__js" in hist_names, str(hist_names))
+    check("未改名工具保持原名", "exec_command" in hist_names, str(hist_names))
+    check("历史里不出现裸名 js", "js" not in hist_names, str(hist_names))
+    tool_msgs = [m for m in chat["messages"] if m.get("role") == "tool"]
+    check("tool 结果消息条数正确（配对不能断）",
+          len(tool_msgs) == 2, str(len(tool_msgs)))
+
+    # ── 3) 无历史时 tools 先行不回归 ──────────────────────────────
+    chat3, route3, _ = responses_request_to_chat(
+        {"model": "m", "input": [{"type": "message", "role": "user",
+                                  "content": "hi"}], "tools": body["tools"]},
+        enable_web_search=False)
+    check("无历史请求 tools 仍正常转换",
+          [t["function"]["name"] for t in chat3.get("tools", [])] ==
+          ["cua_repl__js", "node_repl__js", "exec_command"],
+          str([t["function"]["name"] for t in chat3.get("tools", [])]))
+
+    # ── 4) 出站兜底：模型裸调 js，转换器自动补 namespace ───────────
+    # 唯一匹配场景：路由表里该裸名只对应一个上游工具
+    conv = ResponsesStreamConverter(model="step-5-preview",
+                                    name_route={
+                                        "cua_repl__js": ("mcp__cua_repl", "js"),
+                                        "exec_command": ("", "exec_command"),
+                                    })
+    item = conv._fc_item({"fc_id": "fc_1", "id": "call_1", "name": "js",
+                          "args": '{"code":"1"}'}, "completed")
+    check("唯一匹配时模型裸调自动补 namespace",
+          item.get("namespace") == "mcp__cua_repl", str(item))
+    check("唯一匹配时 name 还原为裸名", item.get("name") == "js", str(item))
+    # 用对名字时行为不变
+    item2 = conv._fc_item({"fc_id": "fc_2", "id": "call_2",
+                           "name": "cua_repl__js", "args": "{}"}, "completed")
+    check("用对名字时 namespace 正确",
+          item2.get("namespace") == "mcp__cua_repl", str(item2))
+    check("用对名字时 name 还原为裸名", item2.get("name") == "js", str(item2))
+    # 裸名匹配多个上游工具时不兜底（交给客户端报错，好过路由错服务器）
+    conv2 = ResponsesStreamConverter(model="step-5-preview",
+                                     name_route={
+                                         "a__js": ("mcp__a", "js"),
+                                         "b__js": ("mcp__b", "js"),
+                                     })
+    item3 = conv2._fc_item({"fc_id": "fc_3", "id": "call_3", "name": "js",
+                            "args": "{}"}, "completed")
+    check("裸名匹配多个时不兜底（不路由错服务器）",
+          item3.get("namespace") is None, str(item3))
+
+    # ── 5) 真实抓包回归：Codex 0.162 只给「本轮新建」的调用带 namespace ────
+    # 284 条历史里仅 4 条带 namespace，213 条裸名无字段。映射不到时模型照着
+    # 历史裸调 → 死循环复发。这里按调用代码里的表面 API 特征分流。
+    route2 = {
+        "cua_repl__js": ("mcp__cua_repl", "js"),
+        "node_repl__js": ("mcp__node_repl", "js"),
+    }
+    browser_code = json.dumps(
+        {"code": 'const tab = await cua.createBrowserTab("iab", "http://x");'
+                 'await tab.getAXState();'})
+    check("浏览器 API 代码映射到浏览器表面",
+          _route_upstream_name("js", "", route2, browser_code) == "cua_repl__js",
+          _route_upstream_name("js", "", route2, browser_code))
+    desktop_code = json.dumps({"code": 'nodeRepl.write("hi"); desktop.shell();'})
+    check("桌面 API 代码映射到桌面表面",
+          _route_upstream_name("js", "", route2, desktop_code) == "node_repl__js",
+          _route_upstream_name("js", "", route2, desktop_code))
+    mixed_code = json.dumps(
+        {"code": 'const c = await tab.capabilities.get("cdp"); nodeRepl.write(1);'})
+    check("代码特征只命中一个表面时按该表面映射",
+          _route_upstream_name("js", "", route2, mixed_code) == "node_repl__js",
+          _route_upstream_name("js", "", route2, mixed_code))
+    both_code = json.dumps(
+        {"code": 'await cua.getState(); nodeRepl.write(1);'})
+    check("同时命中两个表面的特征（有歧义）不映射",
+          _route_upstream_name("js", "", route2, both_code) == "js",
+          _route_upstream_name("js", "", route2, both_code))
+    no_feature = json.dumps({"title": "重置"})
+    check("无代码特征不映射",
+          _route_upstream_name("js", "", route2, no_feature) == "js",
+          _route_upstream_name("js", "", route2, no_feature))
+
+    # 会话级多数派：多数有明确特征 + 少量无特征 → 无特征的也归位，
+    # 让「工具定义 vs 历史示范」彻底自洽
+    items = []
+    for _ in range(5):
+        items.append({"type": "function_call", "name": "js",
+                      "arguments": browser_code, "call_id": f"c{_}"})
+    items.append({"type": "function_call", "name": "js",
+                  "arguments": no_feature, "call_id": "cx"})
+    msgs = _convert_input_items(items, route2)
+    hist2 = [tc["function"]["name"] for m in msgs if m.get("role") == "assistant"
+             for tc in m.get("tool_calls", [])]
+    check("会话级多数派让无特征的裸名也归位",
+          set(hist2) == {"cua_repl__js"} and len(hist2) == 6, str(hist2))
+
+    # 孤证无特征：没有任何明确命中可作依据 → 保持原名（宁缺勿错）
+    msgs2 = _convert_input_items(
+        [{"type": "function_call", "name": "js", "arguments": no_feature,
+          "call_id": "c0"}], route2)
+    hist3 = [tc["function"]["name"] for m in msgs2 if m.get("role") == "assistant"
+             for tc in m.get("tool_calls", [])]
+    check("孤证无特征不构成多数派，保持原名", hist3 == ["js"], str(hist3))
+
+
 def test_model_context() -> None:
     """模型上下文能力：上游给的 contextWindow / maxInputTokens 必须保住并对外暴露。
 
@@ -1059,6 +1236,7 @@ def main() -> int:
     test_max_tokens_clamp()
     test_protocol_adapters()
     test_tool_namespace_rename()
+    test_history_call_name_routing()
     test_hardening()
     test_client_identity()
     test_client_attribution()
