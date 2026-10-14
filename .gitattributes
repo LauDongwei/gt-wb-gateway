@@ -1,0 +1,11 @@
+# 跨平台文本的行尾约定
+#
+# 背景：core.autocrlf=true 时，Windows 工作区的 LF 会在下次 Git 触碰时被转成
+# CRLF。仓库里若混入 CRLF 的 shell 脚本，macOS 检出后会报
+# `bad interpreter: /bin/bash^M`，看门狗静默不运行、网关重启后再也起不来。
+# 这里对会被 macOS 执行或阅读的文本强制 LF，对 Windows 批处理强制 CRLF。
+*.sh    text eol=lf
+*.plist text eol=lf
+*.md    text eol=lf
+*.bat   text eol=crlf
+
