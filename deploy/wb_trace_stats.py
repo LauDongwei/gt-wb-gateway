@@ -9,12 +9,24 @@ curl 等第三方客户端）。而 WorkBuddy 桌面客户端**自己**调用同
 
 好在客户端把每次模型调用都落成了本地追踪文件：
 
-    <用户目录>/.workbuddy/traces/<workerPid>/trace_*.json
+    <用户目录>/.workbuddy/traces/<workerPid>/trace_*.json    ← 旧格式（2026-10 前）
+    <用户目录>/.workbuddy/traces/<workerPid>/trace_*.jsonl   ← 新格式（客户端更新后）
 
-顶层 `trace.startedAt` 给日期；`spans[]` 里 `type == "generation"` 的每个 span
-的 `toolOutput` 是一段 JSON 字符串，解析后是标准 OpenAI 响应体，含
-`model` 与 `usage{prompt_tokens, completion_tokens, total_tokens,
+**两种格式都要读**（2026-10-16 踩坑：客户端静默把 `.json` 换成 `.jsonl` 事件流，
+只 glob 旧后缀的聚合器会**整段漏读**，看板「今日」恒为 0 且无从报错）：
+
+| | 旧 `.json` | 新 `.jsonl` |
+|---|---|---|
+| 结构 | 单个 JSON 对象，含 `trace` + `spans[]` | **事件流**，每行一个 JSON |
+| 事件 | — | `trace_start` / `span_start` / `span_end` / `trace_end` |
+| 用量位置 | `spans[]` 里 `type=="generation"` 的 span | `span_end` 事件里 `span.type=="generation"` |
+| 写入方式 | 写完即终态 | **追加写**，运行中 size 持续增长 |
+| `toolOutput` | JSON 数组字符串，`[0]` 是 OpenAI 响应体 | 同左 |
+
+`usage{prompt_tokens, completion_tokens, total_tokens,
 prompt_tokens_details.cached_tokens, completion_tokens_details.reasoning_tokens}`。
+`startedAt` 是 **UTC**，聚合时统一转本地时区（否则北京时间早 8 点前的调用
+会被归到前一天，看板「今日」整体错位）。
 
 本模块把这些文件聚合为「按日 × 按模型」的 token 账，供状态看板与网关口径相加。
 
@@ -37,7 +49,7 @@ prompt_tokens_details.cached_tokens, completion_tokens_details.reasoning_tokens}
 """
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # 默认 traces 根目录（本机 WorkBuddy 用户目录）
 DEFAULT_TRACES_DIR = os.path.join(
@@ -48,67 +60,141 @@ DEFAULT_TRACES_DIR = os.path.join(
 _FILE_CACHE: dict = {}
 
 
+def _day_hour(iso: str) -> tuple:
+    """ISO8601 时间戳 → (本地日期, 本地小时)。
+
+    客户端写的是 **UTC**（形如 `2026-10-16T15:21:12.914Z`）。直接按字符串切
+    日期/小时会让北京时间早上 8 点前的调用被归到前一天 —— 看板的「今日」
+    会整体错位，且按小时分布整段左偏 8 小时。因此这里统一转本地时区。
+    """
+    if not iso:
+        return "", -1
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:  # 老数据没带时区标记，按 UTC 解
+            dt = dt.replace(tzinfo=timezone.utc)
+        loc = dt.astimezone()
+        return loc.strftime("%Y-%m-%d"), loc.hour
+    except Exception:
+        return iso[:10], -1
+
+
+def _usages_from_span(sp: dict) -> list:
+    """从单个 generation span 里抽出用量记录（新旧格式通用）。
+
+    `toolOutput` 是一段 JSON 字符串，解析后是**数组**，`[0]` 是标准 OpenAI
+    响应体，含 `model` 与 `usage{...}`。
+    """
+    raw = sp.get("toolOutput")
+    if not isinstance(raw, str):
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list) or not parsed:
+        return []
+    rec = parsed[0]
+    if not isinstance(rec, dict):
+        return []
+    usage = rec.get("usage")
+    if not isinstance(usage, dict):
+        return []
+    pdt = usage.get("prompt_tokens_details") or {}
+    cdt = usage.get("completion_tokens_details") or {}
+    if not isinstance(pdt, dict):
+        pdt = {}
+    if not isinstance(cdt, dict):
+        cdt = {}
+    day, hour = _day_hour(sp.get("startedAt") or "")
+    return [{
+        "day": day,
+        "hour": hour,
+        "model": rec.get("model") or "(unknown)",
+        "p": usage.get("prompt_tokens") or 0,
+        "c": usage.get("completion_tokens") or 0,
+        "t": usage.get("total_tokens") or 0,
+        "cached": pdt.get("cached_tokens") or 0,
+        "reason": cdt.get("reasoning_tokens") or 0,
+    }]
+
+
+def _extract_usages_json(path: str) -> list:
+    """旧格式：整个文件是一个 JSON 对象，含 `trace` 与 `spans[]`。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    trace = data.get("trace") or {}
+    if not isinstance(trace, dict):
+        trace = {}
+    spans = data.get("spans")
+    if not isinstance(spans, list):
+        return []
+    out = []
+    for sp in spans:
+        if not isinstance(sp, dict) or sp.get("type") != "generation":
+            continue
+        if not sp.get("startedAt"):  # 老 span 没带时间 → 回退 trace 的
+            sp = dict(sp, startedAt=trace.get("startedAt") or "")
+        out.extend(_usages_from_span(sp))
+    return out
+
+
+def _extract_usages_jsonl(path: str) -> list:
+    """新格式（2026-10 客户端更新）：**事件流**，每行一个 JSON。
+
+    事件类型：`trace_start` / `span_start` / `span_end` / `trace_end`。
+    用量只存在于 `span_end` 且 `span.type == "generation"` 的事件里。
+    文件是**追加写**的，size 会变，缓存键自然失效，不会读到半个文件。
+    """
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(evt, dict) or evt.get("type") != "span_end":
+                    continue
+                sp = evt.get("span") or {}
+                if isinstance(sp, dict) and sp.get("type") == "generation":
+                    out.extend(_usages_from_span(sp))
+    except Exception:
+        return []
+    return out
+
+
 def _extract_usages(path: str) -> list:
     """从一个 trace 文件里抽出全部 (day, hour, model, usage) 记录。
 
     返回 [{"day","hour","model","p","c","t","cached","reason"}...]。
     任何异常都吞掉并返回 []（看板不能因一个坏文件而挂）。
     """
+    if path.endswith(".jsonl"):
+        return _extract_usages_jsonl(path)
+    return _extract_usages_json(path)
+
+
+def _jsonl_parsable(path: str) -> bool:
+    """事件流是否至少能解析出合法事件（用于 file_stats 分类）。"""
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            data = json.load(f)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                json.loads(line)
+        return True
     except Exception:
-        return []
-
-    trace = data.get("trace") if isinstance(data, dict) else None
-    if not isinstance(trace, dict):
-        return []
-    started = trace.get("startedAt") or ""
-    day = started[:10]
-    try:
-        hour = int(started[11:13])
-    except Exception:
-        hour = -1
-
-    out = []
-    spans = data.get("spans")
-    if not isinstance(spans, list):
-        return []
-    for sp in spans:
-        if not isinstance(sp, dict) or sp.get("type") != "generation":
-            continue
-        raw = sp.get("toolOutput")
-        if not isinstance(raw, str):
-            continue
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            continue
-        if not isinstance(parsed, list) or not parsed:
-            continue
-        rec = parsed[0]
-        if not isinstance(rec, dict):
-            continue
-        usage = rec.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        pdt = usage.get("prompt_tokens_details") or {}
-        cdt = usage.get("completion_tokens_details") or {}
-        if not isinstance(pdt, dict):
-            pdt = {}
-        if not isinstance(cdt, dict):
-            cdt = {}
-        out.append({
-            "day": day,
-            "hour": hour,
-            "model": rec.get("model") or "(unknown)",
-            "p": usage.get("prompt_tokens") or 0,
-            "c": usage.get("completion_tokens") or 0,
-            "t": usage.get("total_tokens") or 0,
-            "cached": pdt.get("cached_tokens") or 0,
-            "reason": cdt.get("reasoning_tokens") or 0,
-        })
-    return out
+        return False
 
 
 class WbTraceIndex:
@@ -129,7 +215,8 @@ class WbTraceIndex:
                 try:
                     for f in os.scandir(entry.path):
                         if f.is_file() and f.name.startswith("trace_") \
-                                and f.name.endswith(".json"):
+                                and (f.name.endswith(".json")
+                                     or f.name.endswith(".jsonl")):
                             files.append(f.path)
                 except Exception:
                     continue
@@ -252,3 +339,73 @@ class WbTraceIndex:
             "last_day": days[-1] if days else None,
             "active_days": len(days),
         }
+
+    # ---- 2026-10-13 看板改版新增（全部只读） --------------------------
+    def days_all(self) -> list:
+        """全部有数据日期的按日合计（升序），供「逐日双轨对账·全部历史」用。"""
+        buckets = {}
+        for r in self._load_all():
+            b = buckets.setdefault(r["day"], self._blank())
+            self._add(b, r)
+        return [
+            {"date": d, **self._finalize(buckets[d])}
+            for d in sorted(buckets) if d
+        ]
+
+    def range_stat(self, lo: str, hi: str) -> dict:
+        """闭区间 [lo, hi]（YYYY-MM-DD）的合计 + 按模型拆分，供分析页区间口径用。"""
+        recs = [r for r in self._load_all() if lo <= r["day"] <= hi]
+        total = self._blank()
+        by_model = {}
+        for r in recs:
+            self._add(total, r)
+            m = by_model.setdefault(r["model"], self._blank())
+            self._add(m, r)
+        return {
+            "total": self._finalize(total),
+            "models": [
+                {"model": m, **self._finalize(v)}
+                for m, v in sorted(by_model.items(), key=lambda x: -x[1]["t"])
+            ],
+        }
+
+    def file_stats(self) -> dict:
+        """trace 文件构成：总数 / 无 generation 记录（含被中断的生成）/ 坏文件。
+
+        看板要把「为什么调用数比文件数少」讲清楚 —— 被中断的生成本来就没有
+        token 可记，不是聚合器丢了数据。
+        """
+        files = self._list_files()
+        no_usage = 0
+        bad = 0
+        for path in files:
+            try:
+                st = os.stat(path)
+            except Exception:
+                bad += 1
+                continue
+            key = (path, int(st.st_mtime), int(st.st_size))
+            hit = _FILE_CACHE.get(key)
+            if hit is None:
+                hit = _extract_usages(path)
+                _FILE_CACHE[key] = hit
+            if hit:
+                continue
+            # 再分一次类：能解析但无 generation → 无用量；解析不了 → 坏文件
+            if path.endswith(".jsonl"):
+                if _jsonl_parsable(path):
+                    no_usage += 1
+                else:
+                    bad += 1
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    json.load(f)
+                no_usage += 1
+            except Exception:
+                bad += 1
+        return {"files": len(files), "no_usage": no_usage, "bad": bad}
+
+    def roots(self) -> list:
+        """traces 根目录列表（当前单实例，留列表形态供将有多实例时直接扩展）。"""
+        return [self.traces_dir]
